@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Countersign</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top" id="top">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-word">Countersign</span>
+    <span class="brand-ver" id="version"></span>
+  </div>
+  <nav class="tabs" id="tabs" aria-label="Views"></nav>
+  <p class="sim-chip">Simulated bank. Scripted agent. No real money.</p>
+  <div class="top-actions">
+    <button type="button" class="btn" id="btn-inbox" aria-haspopup="dialog">Inbox <span class="count" id="inbox-count">0</span></button>
+    <button type="button" class="btn" id="btn-limits" aria-haspopup="dialog">Limits</button>
+    <button type="button" class="btn" id="btn-theme">Dark</button>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <section class="view" id="view-stage" aria-label="Stage" hidden></section>
+  <section class="view" id="view-scoreboard" aria-label="Scoreboard" hidden></section>
+  <section class="view" id="view-playground" aria-label="Playground" hidden></section>
+  <section class="view" id="view-audit" aria-label="Audit" hidden></section>
+  <section class="view" id="view-live" aria-label="Live console" hidden></section>
+</main>
+
+<aside class="sheet" id="sheet" role="dialog" aria-labelledby="sheet-title" hidden>
+  <div class="sheet-head">
+    <h2 id="sheet-title" tabindex="-1"></h2>
+    <button type="button" class="btn" id="sheet-close">Close</button>
+  </div>
+  <div class="sheet-body" id="sheet-body"></div>
+</aside>
+
+<div class="gate" id="gate" role="alert" hidden>
+  <div class="gate-card">
+    <p class="gate-brand">Countersign</p>
+    <p class="gate-text">Open the link printed in the terminal where Countersign is running. It carries a one-time key for this console.</p>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<noscript><p class="noscript">This console needs JavaScript. Nothing is loaded from outside this machine.</p></noscript>
+</body>
+</html>

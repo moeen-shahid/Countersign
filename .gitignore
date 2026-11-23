@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
+
+# Countersign runtime files
+*.db
+*.db-wal
+*.db-shm
+receipts.jsonl
+countersign-demo/

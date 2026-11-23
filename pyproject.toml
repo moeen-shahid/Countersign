@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "countersign"
+version = "0.2.0"
+description = "A payment firewall for AI agents: money only moves if it traces back to what the user asked for."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+countersign = "countersign.__main__:main"
+
+[tool.setuptools]
+packages = ["countersign"]
+
+[tool.setuptools.package-data]
+countersign = ["static/*"]
