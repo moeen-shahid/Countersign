@@ -42,9 +42,16 @@ from countersign.store import (
     StoreExists,
     StoreMissing,
     StoreVersionError,
+    TYPED_BACK,
+    ApprovalRefused,
     audit_head,
+    needs_typed_account,
+    offers_remember_account,
+    offers_usual_amount,
     open_agent,
+    with_typed_back,
 )
+from countersign.iban import fmt_iban
 from countersign.toolsurface import pay_view
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -103,8 +110,13 @@ def answer_hold(store: Store, attempt, hold_id: str, approver: str) -> None:
     if approve:
         for _ in range(3):
             hold = store.hold(hold_id)
+            # A hold about the account needs it typed back. The careful approver
+            # types what the vendor confirms (the payment is genuine); the careless
+            # one copies it from the screen. Either way it is the hold's account.
+            typed = hold.request.account if needs_typed_account(hold) else None
             answer = store.console().approve(
-                hold.id, approver=f"{approver} approver", digest=hold.digest
+                hold.id, approver=f"{approver} approver", digest=hold.digest,
+                confirmed_account=typed,
             )
             if answer.transfer_id is not None or answer.decision.outcome is not Outcome.HOLD:
                 break
@@ -175,7 +187,8 @@ class ReplayTests(TempDir):
         hold = store.hold(answer["hold_id"])
 
         ours = store.console().approve(
-            hold.id, approver="sam", digest=hold.digest, attestation="not checked"
+            hold.id, approver="sam", digest=hold.digest, attestation="not checked",
+            confirmed_account=fmt_iban(MULE_2),
         )
         theirs = expected.guard.approve(
             hold.id, "sam", digest=hold.digest, attestation="not checked"
@@ -312,7 +325,9 @@ class BoundaryTests(TempDir):
             port.extra = 1  # no room to hang anything else on it
 
     def test_the_console_has_exactly_the_person_s_four_methods(self):
-        self.assertEqual(public(Console), ["approve", "end_task", "reject", "start_task"])
+        # Changed (v0.3 fix): check_account logs a wrong account typed back (CLI).
+        self.assertEqual(public(Console),
+                         ["approve", "check_account", "end_task", "reject", "start_task"])
 
     def test_open_agent_returns_only_the_port(self):
         store = self.make()
@@ -541,12 +556,68 @@ class TaskTests(TempDir):
         other = self.make("other.db")
         hold_id = self.held(other)
         result = other.console().approve(hold_id, approver="sam", remember_account=True,
-                                         attestation="checked")
+                                         attestation="checked", confirmed_account=MULE_2)
         self.assertEqual(result.transfer_id, "T001")
         self.assertIn(MULE_2, other.state()["vendors"][0]["accounts"])
         approved = [e for e in other.audit_entries() if e["event"] == "hold_approved"][0]
         self.assertEqual(approved["data"]["attestation"], "checked")
         self.assertEqual(approved["data"]["approver"], "sam")
+
+
+class ApprovalCheckTests(TempDir):
+    """The person's side checks an approval in the same transaction as the guard."""
+
+    def test_a_hold_about_the_account_needs_the_account_typed_back(self):
+        store = self.make()
+        hold_id = self.held(store)
+        head, state = store.head(), store.state()
+        lookalike = "DE89370400440338013000"  # D01: shares 12 + 4 characters with NIMBUS
+        for typed in (None, "", NIMBUS, lookalike, MULE_2[:-1], MULE_2[-4:], 42):
+            with self.subTest(typed=typed):
+                with self.assertRaises(ApprovalRefused):
+                    store.console().approve(hold_id, approver="sam", confirmed_account=typed)
+        # Changed (v0.3 fix): an account typed back that is not the hold's is logged
+        # (hold_confirmation_failed) and kept; nothing else changes.
+        self.assertEqual(store.state(), state)
+        added = store.audit_entries(head[0])
+        self.assertEqual({e["event"] for e in added}, {"hold_confirmation_failed"})
+        self.assertEqual([e["data"]["typed_account"] for e in added],
+                         [NIMBUS, lookalike, None, None])
+        self.assertEqual(store.verify(), (True, None))
+        result = store.console().approve(hold_id, approver="sam",
+                                         confirmed_account=f"iban {fmt(MULE_2).lower()}")
+        self.assertEqual(result.transfer_id, "T001")
+        # The attestation is passed on unchanged; the screens word it.
+        approved = [e for e in store.audit_entries() if e["event"] == "hold_approved"][0]
+        self.assertEqual(approved["data"]["attestation"], "")
+
+    def test_a_stale_digest_is_reported_before_the_account(self):
+        store = self.make()
+        hold_id = self.held(store)
+        with self.assertRaises(ValueError) as caught:
+            store.console().approve(hold_id, approver="sam", digest="0" * 64)
+        self.assertNotIsInstance(caught.exception, ApprovalRefused)
+        self.assertIn("changed since it was displayed", str(caught.exception))
+
+    def test_only_a_hold_about_the_amount_is_marked_usual(self):
+        store = self.make()
+        hold_id = self.held(store)
+        with self.assertRaises(ApprovalRefused):
+            store.console().approve(hold_id, approver="sam", confirmed_account=MULE_2,
+                                    usual_amount=True)
+        port = store.agent()
+        held = port.pay(N, NIMBUS, "1900.00", "INV-2050")
+        self.assertIn("A1", held["rules"])
+        hold = store.hold(held["hold_id"])
+        self.assertTrue(offers_usual_amount(hold))
+        self.assertFalse(needs_typed_account(hold) or offers_remember_account(hold))
+        # A typed account must match even where none is needed.
+        with self.assertRaises(ApprovalRefused):
+            store.console().approve(hold.id, approver="sam", confirmed_account=MULE_2)
+
+    def test_with_typed_back_words_the_attestation(self):
+        self.assertEqual(with_typed_back(""), TYPED_BACK)
+        self.assertEqual(with_typed_back(" checked "), f"checked; {TYPED_BACK}")
 
 
 # --- reading ----------------------------------------------------------------------
@@ -579,16 +650,17 @@ class ReadingTests(TempDir):
 
         state = shot["state"]
         self.assertEqual(state["mandate"]["id"], "mandate-attack-05")
-        self.assertEqual((state["task"]["spent"], state["task"]["payments"]), ("240.00", 1))
+        # Changed (fix3): the 240.00 is written in hidden text, so both payments wait (T1).
+        self.assertEqual((state["task"]["spent"], state["task"]["payments"]), ("0.00", 0))
         self.assertEqual([o["name"] for o in state["observations"] if o["origin"] == "untrusted"],
                          list(scenario.documents))
-        self.assertEqual([t["id"] for t in state["bank"]["transfers"]], ["T001"])
-        self.assertEqual(state["bank"]["balance"], "49760.00")
-        self.assertEqual([h["id"] for h in state["holds"]], ["H001"])
+        self.assertEqual([t["id"] for t in state["bank"]["transfers"]], [])
+        self.assertEqual(state["bank"]["balance"], "50000.00")
+        self.assertEqual([h["id"] for h in state["holds"]], ["H001", "H002"])
         decisions = [e for e in shot["entries"] if e["event"] == "payment_decision"]
         self.assertEqual([d["data"]["decision"]["outcome"] for d in decisions],
-                         ["ALLOW", "HOLD"])
-        self.assertEqual(decisions[1]["data"]["hold"], "H001")
+                         ["HOLD", "HOLD"])
+        self.assertEqual(decisions[1]["data"]["hold"], "H002")
         self.assertTrue(decisions[1]["data"]["decision"]["checks"])
         self.assertTrue(decisions[1]["data"]["decision"]["evidence"]["sightings"])
 
@@ -657,7 +729,8 @@ class ReceiptTests(TempDir):
         store = Store(self.make().path, receipts=receipts)
         self.assertFalse(os.path.exists(receipts))
 
-        store.console().start_task(self.mandate(), confirmed_by="tester")
+        # Three payments typed: the count (S2, v0.3) is not what this test is about.
+        store.console().start_task(self.mandate(max_payments=3), confirmed_by="tester")
         self.assertEqual(self.seqs(receipts), [store.head()[0]])  # authority changed
 
         port = store.agent()
@@ -670,7 +743,8 @@ class ReceiptTests(TempDir):
         self.assertEqual(self.seqs(receipts)[-1], store.head()[0])
         self.assertEqual(len(self.seqs(receipts)), 2)
 
-        self.assertEqual(store.console().approve("H001", approver="sam").transfer_id, "T002")
+        self.assertEqual(store.console().approve("H001", approver="sam",
+                                                 confirmed_account=MULE_2).transfer_id, "T002")
         self.assertEqual(self.seqs(receipts)[-1], store.head()[0])
         port.pay(N, MULE_2, "10.00", "INV-2043")
         store.console().reject("H002", approver="sam")
@@ -723,7 +797,8 @@ WORKER = textwrap.dedent(
     sys.stdin.readline()  # every worker is released at the same moment
     try:
         if sys.argv[2] == "approve":
-            result = store.console().approve(sys.argv[3], approver=sys.argv[4])
+            result = store.console().approve(sys.argv[3], approver=sys.argv[4],
+                                             confirmed_account=sys.argv[5])
             out = {"outcome": result.decision.outcome.value, "transfer": result.transfer_id}
         else:
             answer = store.agent().pay(*sys.argv[3:7])
@@ -775,7 +850,7 @@ class ConcurrencyTests(TempDir):
         store = self.make()
         hold_id = self.held(store)
         results = release_together(
-            [[store.path, "approve", hold_id, f"approver-{i}"] for i in range(8)]
+            [[store.path, "approve", hold_id, f"approver-{i}", MULE_2] for i in range(8)]
         )
         paid = [r for r in results if r.get("transfer")]
         refused = [r for r in results if "error" in r]
@@ -817,7 +892,9 @@ class ConcurrencyTests(TempDir):
 
     def test_threads_sharing_one_store_keep_one_chain(self):
         store = self.make()
-        mandate = self.mandate(max_per_payment=Decimal("100"), max_total=Decimal("250"))
+        # Twelve payments typed, so the budget (M4) is what stops them, not S2 (v0.3).
+        mandate = self.mandate(max_per_payment=Decimal("100"), max_total=Decimal("250"),
+                               max_payments=12)
         store.console().start_task(mandate, confirmed_by="tester")
         answers: list[dict] = []
         gate = threading.Barrier(12)

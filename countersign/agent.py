@@ -37,6 +37,30 @@ DEFAULT_DELAY = 0.6  # seconds between calls, so the console can be watched
 LABEL = "scripted agent (no model)"
 
 
+def one_task_ids() -> list[str]:
+    """The scenarios this command (and quickstart) can replay: one task each."""
+    return [sid for sid, scenario in BY_ID.items() if len(scenario.tasks()) == 1]
+
+
+def several_tasks(scenario: Any) -> str | None:
+    """Why a scenario of several tasks is not replayed here, or None.
+
+    The scripted agent acts inside the task a person started, on the
+    documents in one inbox. A scenario of several tasks needs a person to
+    start each next task, with its own sentence and its own documents, which
+    the agent cannot and must not do. The web console's Stage replays every
+    task of it.
+    """
+    count = len(scenario.tasks())
+    if count == 1:
+        return None
+    return (f"scenario {scenario.id} has {count} tasks, one after another. The scripted agent "
+            "replays one task: the one a person started, with the documents in one inbox. "
+            "Starting the next task is a person's job, so it cannot replay the rest. See every "
+            "task on the Stage of the web console (python3 -m countersign dashboard), or pick "
+            "a scenario with one task.")
+
+
 class MemoryBackend:
     """The tools' backend over a guard that lives in this process."""
 
@@ -238,7 +262,11 @@ def _describe(made: Call) -> list[str]:
             extra = f"  hold {_show(result['hold_id'], 20)}"
         if result.get("transfer_id"):
             extra += f"  transfer {_show(result['transfer_id'], 20)}"
-        answer(f"{_show(result.get('outcome'), 10)} {_show(result.get('rule'), 10)}{extra}")
+        # Every rule a held payment carries ("HOLD P2 A2"), as the console shows them.
+        rules = result.get("rules")
+        codes = " ".join(_show(rule, 10) for rule in rules[:12]) if isinstance(rules, list) \
+            and rules else _show(result.get("rule"), 10)
+        answer(f"{_show(result.get('outcome'), 10)} {codes}{extra}")
         answer(_show(result.get("reason", ""), 600))
     elif made.tool == "payment_status":
         transfer = result.get("transfer_id")
@@ -255,9 +283,13 @@ def _command(args: argparse.Namespace) -> int:
         return 2
     scenario = BY_ID.get(args.scenario)
     if scenario is None:
-        known = ", ".join(sorted(BY_ID))
+        known = ", ".join(sorted(one_task_ids()))
         print(f"countersign agent: there is no scenario {_show(args.scenario, 40)}. "
               f"Scenarios: {known}.", file=sys.stderr)
+        return 2
+    refused = several_tasks(scenario)
+    if refused is not None:
+        print(f"countersign agent: {refused}", file=sys.stderr)
         return 2
     if args.delay < 0:
         print("countersign agent: --delay must be 0 or more.", file=sys.stderr)

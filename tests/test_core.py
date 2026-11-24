@@ -26,7 +26,9 @@ from countersign.audit import AuditLog, reconcile
 from countersign.bank import BankDeclined, InsufficientFunds, MockBank
 from countersign.guard import DECLINED, UNCONFIRMED, Guard, Hold, PayResult
 from countersign.iban import fmt_iban
+from countersign.drafting import draft_mandate
 from countersign.models import (
+    Ask,
     Decision,
     Mandate,
     Outcome,
@@ -39,6 +41,7 @@ from countersign.models import (
     typed_accounts,
 )
 from countersign.policy import (
+    DOCUMENT_RULES,
     GUARD_MODES,
     MAX_PENDING_HOLDS,
     RULE_GUARDS,
@@ -90,8 +93,13 @@ def mandate(clock, **over) -> Mandate:
         expires_at=clock() + timedelta(hours=8),
     )
     values.update(over)
-    if "accounts" not in values:  # what a drafted mandate does
+    if "accounts" not in values:
+        # The widest binding a person could confirm: the first drafting rule bound
+        # every IBAN of a one-payee sentence (`typed_accounts`). The drafter binds a
+        # subset (tests/test_drafting.py); these guard tests start from the wider one.
         values["accounts"] = typed_accounts(values["instruction"], values["payees"])
+    # No `asks` unless a test gives them: the policy then expects one payment per
+    # payee (S2) and, for a payee with no usual amount, asks a person (A2).
     return Mandate(**values)
 
 
@@ -109,10 +117,18 @@ def make(mode="countersign", bank=None, start=True, **over):
     return guard, clock
 
 
-def fernhill(**over):
-    """A task for a payee with no vendor record whose account the user dictated."""
+def fernhill(stated=None, payments=None, **over):
+    """A task for a payee with no vendor record whose account the user dictated.
+
+    The user also states an amount (by default the task budget): a payee with no
+    usual amount and no stated amount is held under A2, which is not what most
+    of these tests are about. `payments` is how many payments the sentence asks
+    for (S2); left out, one.
+    """
     values = dict(instruction=f"Pay Fernhill Design to {fmt(FERNHILL)}.", payees=(F,))
     values.update(over)
+    amount = stated if stated is not None else values.get("max_total", Decimal("3000"))
+    values.setdefault("asks", {F: Ask(amount=amount, payments=payments)})
     return make(**values)
 
 
@@ -319,21 +335,32 @@ class MandateTests(unittest.TestCase):
 
 class RuleTableTests(unittest.TestCase):
     def test_the_table(self):
+        # v0.3: the sentence rules (S1, S2, S3, M7), the rules on what was paid and
+        # what waits (P3, A2, D3, H2), in the order they are evaluated.
         self.assertEqual(
-            RULE_ORDER,
-            ("M0", "M1", "F1", "M2", "M3", "M4", "M5", "M6", "B1", "O1", "R1", "H1",
-             "P1", "P2", "D1", "A1"),
+            RULE_ORDER,  # changed (v0.3 fix): D2, one exact payment twice in a task, refused
+            # changed (fix3): F2 mixed alphabets, S4 exclusions, A3 the amount on an
+            # account hold, D4 two invoices with the number you named, T1 hidden figures
+            ("M0", "M1", "F1", "F2", "M2", "M3", "M4", "M5", "M6", "S3", "B1", "M7", "O1", "R1",
+             "D2", "H1", "P1", "P2", "P3", "S1", "S2", "S4", "A2", "A1", "A3", "D1", "D4", "T1",
+             "D3", "H2"),
         )
         self.assertEqual(GUARD_MODES, ("rules", "strict", "countersign"))
         self.assertEqual(set(RULES), set(RULE_ORDER))
         self.assertEqual(set(RULE_OUTCOMES), set(RULE_ORDER))
         holds = [rule for rule in RULE_ORDER if RULE_OUTCOMES[rule] == "HOLD"]
-        self.assertEqual(holds, ["P1", "P2", "D1", "A1"])
-        baseline = ("M0", "M1", "F1", "M2", "M3", "M4", "M5", "M6")
+        self.assertEqual(holds, ["P1", "P2", "P3", "S1", "S2", "S4", "A2", "A1", "A3", "D1", "D4",
+                                 "T1", "D3", "H2"])
+        # An invoice the user did not name is refused by every guard (S3). An
+        # amount or a count beyond what the task expects is a refusal (M7) for the
+        # two baselines, which cannot ask a person, and a hold (S1, S2) for Countersign.
+        baseline = ("M0", "M1", "F1", "M2", "M3", "M4", "M5", "M6", "S3")
         ran = {mode: tuple(r for r in RULE_ORDER if mode in RULE_GUARDS[r]) for mode in GUARD_MODES}
-        self.assertEqual(ran["rules"], baseline)
-        self.assertEqual(ran["strict"], baseline + ("B1",))
-        self.assertEqual(ran["countersign"], tuple(r for r in RULE_ORDER if r != "B1"))
+        self.assertEqual(ran["rules"], baseline + ("M7",))
+        self.assertEqual(ran["strict"], baseline + ("B1", "M7"))
+        self.assertEqual(ran["countersign"],
+                         tuple(r for r in RULE_ORDER if r not in ("B1", "M7")))
+        self.assertEqual(DOCUMENT_RULES, ("D4", "T1"))  # fix3: the rules that read documents
 
     def test_M0_no_active_task(self):
         for mode in GUARD_MODES:
@@ -415,8 +442,10 @@ class RuleTableTests(unittest.TestCase):
 
     def test_M4_task_budget(self):
         for mode in ("rules", "countersign"):
+            # S2/M7 (v0.3): the sentence asks for three payments, so the count is not
+            # what stops the third one.
             guard, _ = fernhill(mode=mode, max_per_payment=Decimal("600"),
-                                max_total=Decimal("1000"))
+                                max_total=Decimal("1000"), payments=3)
             self.assertEqual(code(guard.pay(F, FERNHILL, "600", "FD-1")), "ALLOW:OK")
             over = guard.pay(F, FERNHILL, "400.01", "FD-2")
             self.assertEqual(code(over), "BLOCK:M4")
@@ -434,24 +463,35 @@ class RuleTableTests(unittest.TestCase):
             self.assertEqual(check(second, "M5").status, "pass")
             self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-3")), "BLOCK:M5")
         guard, _ = make()
-        for i in range(4):
-            result = guard.pay(N, NIMBUS, "100", f"INV-{i}")
-            self.assertEqual(code(result), "ALLOW:OK")
-            self.assertEqual(check(result, "M5").status, "na")
+        first = guard.pay(N, NIMBUS, "100", "INV-0")
+        self.assertEqual(code(first), "ALLOW:OK")
+        self.assertEqual(check(first, "M5").status, "na")
+        # S2 (v0.3): with no count a person typed, M5 does not apply, but one
+        # payment per payee is expected, so the second one waits for a person.
+        second = guard.pay(N, NIMBUS, "100", "INV-1")
+        self.assertEqual(code(second), "HOLD:S2")
+        self.assertEqual(check(second, "M5").status, "na")
 
-    def test_M5_counts_executed_payments_not_waiting_ones(self):
+    def test_M5_counts_executed_payments_and_H2_counts_waiting_ones(self):
         guard, _ = make(max_payments=1)
         guard.observe("mail.eml", fmt(MULE_1))
         held = guard.pay(N, MULE_1, "100", "INV-1")
         self.assertEqual(code(held), "HOLD:P1")
-        self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-2")), "ALLOW:OK")
-        self.assertEqual(code(guard.approve(held.hold_id)), "BLOCK:M5")
-        self.assertEqual(guard.hold(held.hold_id).status, "blocked")
+        # H2 (v0.3, adversary C04): a waiting payment counts as made, so the next
+        # one waits too instead of using up the one payment the mandate allows.
+        second = guard.pay(N, NIMBUS, "100", "INV-2")
+        self.assertEqual(code(second), "HOLD:H2")
+        self.assertEqual(check(second, "M5").status, "pass")  # M5 counts executed payments
+        guard.reject(held.hold_id)
+        self.assertIsNotNone(guard.approve(second.hold_id).transfer_id)
+        self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-3")), "BLOCK:M5")
         self.assertEqual(len(guard.bank.transfers), 1)
 
     def test_M6_named_invoices(self):
         for mode in GUARD_MODES:
-            guard, _ = make(mode, references=("INV-2041", "INV 2042"))
+            # S2/M7 (v0.3): the person also typed two payments, so the second one
+            # is not held or refused for being one too many.
+            guard, _ = make(mode, references=("INV-2041", "INV 2042"), max_payments=2)
             self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-2043")), "BLOCK:M6")
             self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-2041-B")), "BLOCK:M6")
             self.assertEqual(code(guard.pay(N, NIMBUS, "100", "inv 2041.")), "ALLOW:OK")
@@ -462,7 +502,8 @@ class RuleTableTests(unittest.TestCase):
         self.assertEqual(check(free, "M6").status, "na")
 
     def test_B1_account_allowlist_in_the_strict_guard_only(self):
-        guard, _ = make("strict", payees=(N, F))
+        # M7 (v0.3): three payments typed, two of them left for Nimbus.
+        guard, _ = make("strict", payees=(N, F), max_payments=3)
         guard.observe("mail.eml", f"{fmt(MULE_1)} {fmt(FERNHILL)}")
         self.assertEqual(code(guard.pay(N, MULE_1, "100", "INV-1")), "BLOCK:B1")
         self.assertEqual(code(guard.pay(N, KESTREL, "100", "INV-1")), "BLOCK:B1")
@@ -510,28 +551,53 @@ class RuleTableTests(unittest.TestCase):
         # Another account, or another payee, was not rejected.
         self.assertEqual(code(guard.pay(N, MULE_2, "480", "INV-1")), "HOLD:P1")
         self.assertEqual(code(guard.pay(F, MULE_1, "480", "FD-1")), "HOLD:P2")
-        self.assertEqual(code(guard.pay(N, NIMBUS, "480", "INV-1")), "ALLOW:OK")
+        # The account on file was not rejected (R1 passes). It waits only because a
+        # payment of the same invoice to another account waits (D3, v0.3).
+        on_file = guard.pay(N, NIMBUS, "480", "INV-1")
+        self.assertEqual(code(on_file), "HOLD:D3")
+        self.assertEqual(check(on_file, "R1").status, "pass")
         # The rejection lasts for the task.
         guard.start_task(mandate(clock, id="m2"))
         guard.observe("mail.eml", fmt(MULE_1))
         self.assertEqual(code(guard.pay(N, MULE_1, "480", "INV-7")), "HOLD:P1")
 
     def test_H1_too_many_payments_waiting(self):
-        guard, _ = make()
-        guard.observe("mail.eml", fmt(MULE_1))
-        held = [guard.pay(N, MULE_1, "10", f"INV-{i}") for i in range(MAX_PENDING_HOLDS)]
+        # H1 (v0.3): the queue is full when five payments wait because of their
+        # account. Then another such payment is refused, and so is a payment that
+        # would go through without a person: nothing is paid unattended while the
+        # queue is full (that keeps "documents never add an ALLOW" true for a whole
+        # session; see TrustBoundaryTests). A payment to a vouched account that
+        # needs a person anyway still waits.
+        guard, _ = make(payees=(N, B))
+        guard.observe("mail.eml", f"{fmt(MULE_1)} {fmt(MULE_2)}")
+        held = [guard.pay(N, MULE_1 if i == 0 else MULE_2, "10", f"INV-{i}")
+                for i in range(MAX_PENDING_HOLDS)]
         self.assertEqual([code(h) for h in held], ["HOLD:P1"] * 5)
-        self.assertEqual(code(guard.pay(N, MULE_1, "10", "INV-9")), "BLOCK:H1")
+        self.assertEqual(code(guard.pay(N, MULE_2, "10", "INV-9")), "BLOCK:H1")
         self.assertEqual(len(guard.holds), 5)
-        # A payment that needs no countersignature is not affected by the queue.
-        allowed = guard.pay(N, NIMBUS, "480", "INV-2041")
-        self.assertEqual(code(allowed), "ALLOW:OK")
-        self.assertEqual(check(allowed, "H1").status, "na")
-        # Asking again for one that waits returns that hold.
-        self.assertEqual(guard.pay(N, MULE_1, "10", "INV-3").hold_id, held[3].hold_id)
-        # Once a person decides one, there is room again.
-        self.assertIsNotNone(guard.approve(held[0].hold_id).transfer_id)
-        self.assertEqual(code(guard.pay(N, MULE_1, "10", "INV-9")), "HOLD:P1")
+        unattended = guard.pay(B, BRIGHTLINE, "100", "BL-1")
+        self.assertEqual(code(unattended), "BLOCK:H1")
+        self.assertIn("nothing is paid without a person", unattended.decision.reason)
+        queued = guard.pay(N, NIMBUS, "480", "INV-2041")
+        self.assertEqual(code(queued), "HOLD:H2")
+        self.assertEqual(check(queued, "H1").status, "pass")
+        # Changed (v0.3 fix): asked again while the queue is full, a payment about an
+        # account is refused too (the waiting one counts against it).
+        self.assertEqual(code(guard.pay(N, MULE_2, "10", "INV-3")), "BLOCK:H1")
+        # Changed (v0.3 fix): the task is quarantined. Once a person decides one, there
+        # is room in the queue, but nothing is paid without a person until a new task.
+        self.assertEqual(events(guard).count("task_quarantined"), 1)
+        self.assertTrue(guard.quarantined)
+        guard.reject(held[0].hold_id)
+        again = guard.pay(B, BRIGHTLINE, "100", "BL-1")
+        self.assertEqual(code(again), "BLOCK:H1")
+        self.assertIn("This task is quarantined", again.decision.reason)
+        self.assertEqual(code(guard.pay(N, MULE_2, "10", "INV-9")), "BLOCK:H1")
+        self.assertEqual(code(guard.pay(N, NIMBUS, "480", "INV-2042")), "HOLD:H2")
+        self.assertEqual(events(guard).count("task_quarantined"), 1)
+        guard.start_task(mandate(FakeClock(), id="m2", payees=(N, B)))
+        self.assertFalse(guard.quarantined)
+        self.assertEqual(code(guard.pay(B, BRIGHTLINE, "100", "BL-1")), "ALLOW:OK")
 
     def test_P1_not_the_account_on_file(self):
         guard, _ = make()
@@ -542,7 +608,8 @@ class RuleTableTests(unittest.TestCase):
         self.assertEqual(check(held, "P1").status, "hold")
         self.assertEqual(check(held, "P2").status, "na")
         self.assertEqual(guard.bank.transfers, [])
-        allowed = guard.pay(N, NIMBUS, "480", "INV-1")
+        # In a task with no rival payment waiting (D3, v0.3), the account on file is paid.
+        allowed = make()[0].pay(N, NIMBUS, "480", "INV-1")
         self.assertEqual(code(allowed), "ALLOW:OK")
         self.assertEqual(check(allowed, "P1").status, "pass")
 
@@ -551,6 +618,8 @@ class RuleTableTests(unittest.TestCase):
         guard.observe("FD-118.eml", f"IBAN {fmt(FERNHILL)}")
         held = guard.pay(F, FERNHILL, "650", "FD-118")
         self.assertEqual(code(held), "HOLD:P2")
+        # A2 (v0.3): no usual amount and none stated, so the amount is a question too.
+        self.assertEqual(held.decision.rules, ("P2", "A2"))
         self.assertEqual(check(held, "P2").status, "hold")
         self.assertEqual(check(held, "P1").status, "na")
         dictated, _ = fernhill()
@@ -560,11 +629,16 @@ class RuleTableTests(unittest.TestCase):
         self.assertTrue(allowed.decision.evidence.dictated)
 
     def test_D1_possible_duplicate(self):
-        guard, _ = make(payees=(N, B))
-        self.assertEqual(code(guard.pay(N, NIMBUS, "480", "INV-2041")), "ALLOW:OK")
-        again = guard.pay(N, NIMBUS, "480", "INV-2041")
+        # S2 (v0.3): four payments typed, so the count leaves room for the repeat
+        # and D1 is the rule that holds it.
+        guard, _ = make(payees=(N, B), max_payments=4)
+        self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-2041")), "ALLOW:OK")
+        # Changed (v0.3 fix): exactly the same payment again is refused (D2), so the
+        # possible duplicate here is the same invoice for another amount.
+        self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-2041")), "BLOCK:D2")
+        again = guard.pay(N, NIMBUS, "110", "INV-2041")
         self.assertEqual(code(again), "HOLD:D1")
-        self.assertIn("480.00 on 2026-11-23 (transfer T001)", again.decision.reason)
+        self.assertIn("100.00 on 2026-11-23 (transfer T001)", again.decision.reason)
         self.assertEqual(again.decision.evidence.previous_payment["transfer"], "T001")
         # Another invoice, or the same number from another payee, is not a duplicate.
         self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-2042")), "ALLOW:OK")
@@ -572,25 +646,56 @@ class RuleTableTests(unittest.TestCase):
         self.assertEqual(code(other), "ALLOW:OK")
         self.assertEqual(check(other, "D1").status, "pass")
         # Our baselines do not have the rule.
-        baseline, _ = make("strict")
+        baseline, _ = make("strict", max_payments=2)
         baseline.pay(N, NIMBUS, "480", "INV-2041")
         self.assertEqual(code(baseline.pay(N, NIMBUS, "480", "INV-2041")), "ALLOW:OK")
 
     def test_A1_unusual_amount(self):
-        guard, _ = make()  # Nimbus: largest payment on file 495.00, so 742.50 is the line
-        at_line = guard.pay(N, NIMBUS, "742.50", "INV-1")
+        # A1 (v0.3): the line is the largest usual amount plus how far the usual
+        # amounts vary, at least 15% and at most 35% of the largest. Nimbus's usual
+        # amounts are 480.00 to 495.00, so the line is 495.00 + 74.25 = 569.25 (it
+        # was 1.5 x 495.00 = 742.50 in v0.2).
+        guard, _ = make()
+        at_line = guard.pay(N, NIMBUS, "569.25", "INV-1")
         self.assertEqual(code(at_line), "ALLOW:OK")
         self.assertEqual(check(at_line, "A1").status, "pass")
         guard, _ = make()
-        over = guard.pay(N, NIMBUS, "742.51", "INV-1")
+        over = guard.pay(N, NIMBUS, "569.26", "INV-1")
         self.assertEqual(code(over), "HOLD:A1")
+        # The hold says where the line is and why it is there.
+        self.assertIn("The line is 569.25: the largest usual payment (495.00) plus 15%",
+                      over.decision.reason)
         self.assertEqual(over.decision.evidence.baseline, "495.00")
+        self.assertEqual(over.decision.evidence.ceiling, "569.25")
         self.assertEqual(over.decision.evidence.history, ("480.00", "480.00", "495.00"))
-        # No history, no usual amount: the rule does not apply (a stated limit).
+        self.assertEqual(code(make()[0].pay(N, NIMBUS, "742.50", "INV-1")), "HOLD:A1")
+        # No usual amount: A1 does not apply. The amount the user stated bounds it (S1).
         new, _ = fernhill()
         big = new.pay(F, FERNHILL, "2000", "FD-1")
         self.assertEqual(code(big), "ALLOW:OK")
         self.assertEqual(check(big, "A1").status, "na")
+        self.assertEqual(check(big, "A2").status, "na")
+        # A2 (v0.3): no usual amount and no amount stated: a person is asked.
+        unstated, _ = fernhill(asks={})
+        self.assertEqual(code(unstated.pay(F, FERNHILL, "650", "FD-1")), "HOLD:A2")
+
+    def test_A1_the_hold_says_where_the_line_is_and_why(self):
+        from countersign.policy import line_words
+
+        d = Decimal
+        self.assertEqual(
+            line_words((d("480"), d("480"), d("495"))),
+            "The line is 569.25: the largest usual payment (495.00) plus 15%. That is the "
+            "least room the line allows; the usual amounts vary less than that.")
+        self.assertIn("plus 15%. That is the least room the line allows, because there is "
+                      "only one usual amount.", line_words((d("650"),)))
+        self.assertIn("plus 35%. That is the most room the line allows; the usual amounts "
+                      "vary more than that.", line_words((d("89.90"), d("143.20"))))
+        self.assertEqual(
+            line_words((d("275"), d("310"), d("340"))),
+            "The line is 405.00: the largest usual payment (340.00) plus 65.00, as much as "
+            "the usual amounts vary (275.00 to 340.00).")
+        self.assertEqual(line_words(()), "")
 
     def test_hold_rules_are_all_reported(self):
         guard, _ = make()
@@ -598,8 +703,10 @@ class RuleTableTests(unittest.TestCase):
         guard.pay(N, NIMBUS, "480", "INV-2041")
         result = guard.pay(N, MULE_1, "1900", "INV-2041")
         self.assertEqual(code(result), "HOLD:P1")
-        self.assertEqual(result.decision.rules, ("P1", "D1", "A1"))
-        for part in ("Not the account on file.", "Possible duplicate.", "Unusual amount."):
+        # v0.3: also one payment more than expected (S2), in table order.
+        self.assertEqual(result.decision.rules, ("P1", "S2", "A1", "D1"))
+        for part in ("Not the account on file.", "More payments than expected.",
+                     "Possible duplicate.", "Unusual amount."):
             self.assertIn(part, result.decision.reason)
         self.assertTrue(result.decision.reason.endswith("mail.eml."))
 
@@ -777,7 +884,12 @@ class TrustBoundaryTests(unittest.TestCase):
                 self.assertIsNone(authorise(req, ctx))
                 self.assertEqual(classify(req, ctx, ProvenanceTracker()).rule, "O1")
 
-    def test_extra_untrusted_documents_never_change_what_is_allowed(self):
+    def test_extra_untrusted_documents_never_add_an_allow(self):
+        # Documents can make a payment wait for a person (P1, P2), and a waiting
+        # payment counts against every limit (H2, D3), so more documents can
+        # turn an ALLOW into a HOLD. They can never turn anything into an ALLOW:
+        # every payment the twin (which read everything) makes, the guard
+        # (which read less) makes too.
         rng = random.Random(2041)
         accounts = [NIMBUS, BRIGHTLINE, KESTREL, FERNHILL, MULE_1, MULE_2, MULE_3]
         payees = [N, B, K, F, "Harbor Consulting"]
@@ -816,16 +928,18 @@ class TrustBoundaryTests(unittest.TestCase):
                         rng.choice(["INV-1", f"INV-{step}", f"INV-{step}"]))
                 one, two = guard.pay(*args), twin.pay(*args)
                 with self.subTest(trial=trial, step=step, args=args):
-                    self.assertEqual(one.decision.outcome is Outcome.ALLOW,
-                                     two.decision.outcome is Outcome.ALLOW)
-                    moved += one.decision.outcome is not two.decision.outcome
-                    if one.decision.outcome is Outcome.ALLOW:
-                        allowed += 1
+                    if two.decision.outcome is Outcome.ALLOW:
+                        self.assertIs(one.decision.outcome, Outcome.ALLOW)
                         self.assertEqual(one.decision.reason, two.decision.reason)
-                        self.assertEqual(one.transfer_id, two.transfer_id)
-            self.assertEqual(guard.bank.to_state(), twin.bank.to_state())
-            self.assertEqual(guard.spent, twin.spent)
-        self.assertGreater(allowed, 40)  # the comparison was not vacuous,
+                    moved += one.decision.outcome is not two.decision.outcome
+                    allowed += one.decision.outcome is Outcome.ALLOW
+            sent = lambda g: sorted((t["account"], t["amount"]) for t in g.bank.to_state()["transfers"])
+            remaining = sent(guard)
+            for item in sent(twin):
+                self.assertIn(item, remaining)
+                remaining.remove(item)
+            self.assertLessEqual(twin.spent, guard.spent)
+        self.assertGreater(allowed, 15)  # the comparison was not vacuous (D2 and A2 hold more),
         self.assertGreater(moved, 20)  # and the documents did change other answers
 
 
@@ -872,7 +986,9 @@ class ProvenanceFindingTests(unittest.TestCase):
         self.assertFalse(to_dana.decision.evidence.dictated)
         self.assertEqual(guard.bank.transfers, [])
         # When the person assigns the account to Dana, only Dana's payment is free of a hold.
-        bound, _ = make(instruction=text, payees=(dana, K, F), accounts={dana: (MULE_1,)})
+        # A2 (v0.3): Dana has no usual amount, so the person also states one.
+        bound, _ = make(instruction=text, payees=(dana, K, F), accounts={dana: (MULE_1,)},
+                        asks={dana: Ask(amount=Decimal("40"))})
         self.assertEqual(code(bound.pay(dana, MULE_1, "40", "REFUND-1")), "ALLOW:OK")
         self.assertEqual(code(bound.pay(K, MULE_1, "1500", "KL-1")), "HOLD:P1")
         self.assertEqual(code(bound.pay(F, MULE_1, "650", "FD-1")), "HOLD:P2")
@@ -881,7 +997,8 @@ class ProvenanceFindingTests(unittest.TestCase):
         """PROV-3: invoice numbers, fused digits and pieces of an IBAN were trusted."""
         text = (f"Pay Fernhill invoice 4051-6212-345678 dated 2041 2011 2026 48 "
                 f"to {fmt(FERNHILL)} by Friday.")
-        guard, _ = make(instruction=text, payees=(F,))
+        # A2 (v0.3): an amount stated for the payee with no usual amount.
+        guard, _ = make(instruction=text, payees=(F,), asks={F: Ask(amount=Decimal("650"))})
         self.assertEqual(guard.mandate.accounts, {F: (FERNHILL,)})
         for account in ("40516212345678", "20412011202648", FERNHILL[:-2], FERNHILL[4:],
                         FERNHILL + "650", FERNHILL + "BYFRIDAY"):
@@ -889,19 +1006,22 @@ class ProvenanceFindingTests(unittest.TestCase):
                 self.assertEqual(code(guard.pay(F, account, "650", "FD-118")), "BLOCK:F1")
         self.assertEqual(code(guard.pay(F, FERNHILL, "650", "FD-118")), "ALLOW:OK")
 
-    def test_PROV_3_known_limit_one_payee_binds_every_typed_iban(self):
-        """What is left of PROV-3 and TRUST-1, kept visible: with one payee, the
-        drafted mandate binds every IBAN in the sentence, even one the user
-        quoted for another reason. The guard cannot read intent; the binding is
-        in the mandate the person confirms and in the log."""
+    def test_PROV_3_a_warned_account_is_no_longer_bound_B01(self):
+        """What was left of PROV-3 and TRUST-1: with one payee, the first drafting
+        rule (`typed_accounts`) bound every IBAN of the sentence, even one the
+        user quoted to warn against it (adaptive-04, adversary B01). The drafter
+        binds an account only from a positive "to IBAN ..." with no warning in
+        the sentence. The guard still trusts what a confirmed mandate binds."""
         text = f"Pay Fernhill. Do not use {fmt(MULE_1)}, it is a scam."
-        guard, _ = make(instruction=text, payees=(F,))
-        self.assertEqual(guard.mandate.accounts, {F: (MULE_1,)})
-        self.assertEqual(last(guard, "task_started")["mandate"]["accounts"], {F: [MULE_1]})
-        self.assertEqual(code(guard.pay(F, MULE_1, "650", "FD-1")), "ALLOW:OK")
-        # Without the binding, the same sentence vouches for nothing.
+        self.assertEqual(typed_accounts(text, (F,)), {F: (MULE_1,)})  # the first rule
+        self.assertEqual(draft_mandate(text, default_vendors(), [F]).accounts, {})
         unbound, _ = make(instruction=text, payees=(F,), accounts={})
         self.assertEqual(code(unbound.pay(F, MULE_1, "650", "FD-1")), "HOLD:P2")
+        # A binding a person confirms is trusted (with an amount stated: A2, v0.3).
+        bound, _ = make(instruction=text, payees=(F,), accounts={F: (MULE_1,)},
+                        asks={F: Ask(amount=Decimal("650"))})
+        self.assertEqual(last(bound, "task_started")["mandate"]["accounts"], {F: [MULE_1]})
+        self.assertEqual(code(bound.pay(F, MULE_1, "650", "FD-1")), "ALLOW:OK")
 
     def test_PROV_3_an_iban_shaped_invoice_number_is_not_bound_between_several_payees(self):
         text = f"Pay Fernhill invoice {fmt(MULE_1)} and the Nimbus invoice."
@@ -975,7 +1095,7 @@ class ProvenanceFindingTests(unittest.TestCase):
 
     def test_PROV_6_the_account_is_canonicalised_once(self):
         """PROV-6: the raw account string went to the bank and into the log."""
-        guard, _ = make()
+        guard, _ = make(max_payments=5)  # five payments (S2, v0.3)
         junk = "ＬＴ１２ DE89370400440532013000 ‮;--"
         self.assertEqual(code(guard.pay(N, junk, "480", "INV-1")), "BLOCK:F1")
         self.assertEqual(last(guard, "payment_decision")["raw"]["account"], junk)
@@ -1046,27 +1166,43 @@ class StateFindingTests(unittest.TestCase):
         self.assertIn("You gave this account for Nimbus Hosting Ltd, but the vendor file has "
                       f"a different one: {fmt(NIMBUS)}.", held.decision.reason)
         self.assertEqual(guard.bank.transfers, [])
-        self.assertEqual(code(guard.pay(N, NIMBUS, "480", "INV-1")), "ALLOW:OK")
+        # D3 (v0.3): while that payment of INV-1 waits, the account on file waits too.
+        on_file = guard.pay(N, NIMBUS, "480", "INV-1")
+        self.assertEqual(code(on_file), "HOLD:D3")
+        self.assertEqual(on_file.decision.evidence.rivals, (held.hold_id,))
+        guard.reject(held.hold_id)
+        # Changed (v0.3 fix): asked again, it is the payment that already waits, not a
+        # new one; the person approves that one, and nothing is left waiting.
+        again = guard.pay(N, NIMBUS, "480", "INV-1")
+        self.assertEqual((code(again), again.hold_id), ("HOLD:D3", on_file.hold_id))
+        self.assertEqual(guard.related(on_file.hold_id)["rivals"], [])
+        self.assertIsNotNone(guard.approve(on_file.hold_id).transfer_id)
 
     def test_TRUST_1_an_account_dictated_for_one_payee_is_not_trusted_for_another(self):
-        guard, _ = make(payees=(N, F), instruction="Pay both.", accounts={F: (FERNHILL,)})
+        guard, _ = make(payees=(N, F), instruction="Pay both.", accounts={F: (FERNHILL,)},
+                        asks={F: Ask(amount=Decimal("650"))})  # A2 (v0.3)
         self.assertEqual(code(guard.pay(F, FERNHILL, "650", "FD-1")), "ALLOW:OK")
         self.assertEqual(code(guard.pay(N, FERNHILL, "480", "INV-1")), "BLOCK:O1")
 
     def test_D1_1_reference_variants_and_missing_references(self):
         """D1-1: one character, or no reference at all, got past the duplicate check."""
-        guard, clock = make()
-        self.assertEqual(code(guard.pay(N, NIMBUS, "480", "INV-2041")), "ALLOW:OK")
+        # S2 (v0.3): two payments typed, so D1 is the rule that holds the repeat
+        # (and 100.00 twice stays far under the usual-amount line, A1).
+        guard, clock = make(max_payments=2)
+        self.assertEqual(code(guard.pay(N, NIMBUS, "100", "INV-2041")), "ALLOW:OK")
         for variant in ("INV-2041.", "inv 2041", "INV‐2041", " INV_2041 ", "INV-2041"):
             with self.subTest(reference=variant):
-                self.assertEqual(code(guard.pay(N, NIMBUS, "480", variant)), "HOLD:D1")
+                # Changed (v0.3 fix): the same amount again is the same payment (D2);
+                # another amount for the same invoice is the possible duplicate (D1).
+                self.assertEqual(code(guard.pay(N, NIMBUS, "100", variant)), "BLOCK:D2")
+                self.assertEqual(code(guard.pay(N, NIMBUS, "101", variant)), "HOLD:D1")
         for missing in ("", "   "):
-            self.assertEqual(code(guard.pay(N, NIMBUS, "480", missing)), "BLOCK:F1")
+            self.assertEqual(code(guard.pay(N, NIMBUS, "100", missing)), "BLOCK:F1")
         self.assertEqual(len(guard.holds), 1)  # the variants are one waiting payment
         self.assertEqual(len(guard.bank.transfers), 1)
         # The memory outlasts the task.
-        guard.start_task(mandate(clock, id="m2"))
-        later = guard.pay(N, NIMBUS, "480", "inv-2041")
+        guard.start_task(mandate(clock, id="m2", max_payments=3))
+        later = guard.pay(N, NIMBUS, "100", "inv-2041")
         self.assertEqual(code(later), "HOLD:D1")
         self.assertEqual(later.decision.evidence.previous_payment["task"], "m1")
         # References that only look alike after dropping punctuation stay apart.
@@ -1074,41 +1210,69 @@ class StateFindingTests(unittest.TestCase):
         self.assertEqual(code(guard.pay(N, NIMBUS, "10", "INV-11-2")), "ALLOW:OK")
 
     def test_D1_1_a_person_can_approve_a_genuine_instalment(self):
-        guard, _ = make()
+        guard, _ = make(max_payments=2)  # two payments typed (S2, v0.3)
         guard.pay(N, NIMBUS, "200", "CUST-77")
-        second = guard.pay(N, NIMBUS, "200", "CUST-77")
+        # Changed (v0.3 fix): exactly the same payment again is refused (D2) unless the
+        # invoice is typed as paid in parts; a different part still goes to a person.
+        self.assertEqual(code(guard.pay(N, NIMBUS, "200", "CUST-77")), "BLOCK:D2")
+        second = guard.pay(N, NIMBUS, "250", "CUST-77")
         self.assertEqual(code(second), "HOLD:D1")
         self.assertIsNotNone(guard.approve(second.hold_id).transfer_id)
         self.assertEqual(len(guard.bank.transfers), 2)
+        # Typed as two parts of one invoice, two equal parts are paid.
+        typed, _ = make(max_payments=2, references=("CUST-77",))
+        typed.pay(N, NIMBUS, "200", "CUST-77")
+        self.assertEqual(code(typed.pay(N, NIMBUS, "200", "CUST-77")), "ALLOW:OK")
+        self.assertEqual(code(typed.pay(N, NIMBUS, "200", "CUST-77")), "BLOCK:M5")
 
     def test_A1_1_splitting_a_payment_does_not_avoid_the_amount_check(self):
-        """A1-1: 1,480 as 742.50 + 737.50 passed, and each payment raised the baseline."""
-        guard, clock = make()
-        self.assertEqual(code(guard.pay(N, NIMBUS, "742.50", "INV-A")), "ALLOW:OK")
-        second = guard.pay(N, NIMBUS, "737.50", "INV-B")
-        self.assertEqual(code(second), "HOLD:A1")
-        self.assertIn("to 1,480.00; the largest payment to them on file is 495.00",
-                      second.decision.reason)
-        self.assertEqual(second.decision.evidence.paid_to_payee, "742.50")
-        # Not a ladder: the baseline is the one from the start of the task.
-        self.assertEqual(code(guard.pay(N, NIMBUS, "0.01", "INV-C")), "HOLD:A1")
-        self.assertEqual(guard._context().baseline[name_key(N)], Decimal("495.00"))
-        # A payment a person countersigned still counts towards the task's total.
-        guard.approve(second.hold_id)
-        self.assertEqual(code(guard.pay(N, NIMBUS, "1", "INV-D")), "HOLD:A1")
-        # The next task starts from the history as it then is.
-        guard.start_task(mandate(clock, id="m2"))
-        self.assertEqual(guard._context().baseline[name_key(N)], Decimal("742.50"))
+        """A1-1: 1,480 as 742.50 + 737.50 passed, and each payment raised the baseline.
 
-    def test_A1_1_a_first_payment_seeds_the_history_for_the_next_task(self):
-        guard, clock = fernhill()
+        A1 (v0.3): one invoice may come to 569.25 for Nimbus, and the 74.25 above
+        the largest usual amount (495.00) is for the whole task. S2 is kept out
+        of the way with a count of five typed payments."""
+        guard, clock = make(max_payments=5)
+        self.assertEqual(code(guard.pay(N, NIMBUS, "569.25", "INV-A")), "ALLOW:OK")
+        # The same invoice in a second part is added to the first.
+        same = guard.pay(N, NIMBUS, "1.00", "INV-A")
+        self.assertIn("A1", same.decision.rules)
+        # Another invoice may not use the room above the usual amount again.
+        second = guard.pay(N, NIMBUS, "569.25", "INV-B")
+        self.assertEqual(code(second), "HOLD:A1")
+        self.assertIn("the room above the largest usual payment (495.00) is for the whole task",
+                      second.decision.reason)
+        self.assertEqual(second.decision.evidence.paid_to_payee, "569.25")
+        # An invoice at the usual amount does not need that room.
+        self.assertEqual(code(guard.pay(N, NIMBUS, "495.00", "INV-C")), "HOLD:H2")
+        self.assertEqual(guard._context().baseline[name_key(N)], Decimal("495.00"))
+        # A payment a person countersigned still counts towards the task.
+        guard.approve(second.hold_id)
+        self.assertIn("A1", guard.pay(N, NIMBUS, "1", "INV-D").decision.rules)
+        # No ratchet (v0.3, adversary A02): 569.25 is above the usual range, so it
+        # does not become a usual amount, and the next task's line is the same.
+        guard.start_task(mandate(clock, id="m2"))
+        self.assertEqual(guard._context().baseline[name_key(N)], Decimal("495.00"))
+        self.assertIn(Decimal("569.25"), guard.vendors.get(N).other)
+
+    def test_A1_1_a_usual_amount_for_a_new_payee_comes_from_a_person(self):
+        # v0.2 let the first unattended payment to a new payee become its usual
+        # amount. v0.3 (no ratchet, A2): only an amount inside the usual range, or
+        # one a person marks as usual when approving, joins the usual amounts.
+        guard, clock = fernhill(stated=Decimal("650"))
         self.assertEqual(code(guard.pay(F, FERNHILL, "650", "FD-1")), "ALLOW:OK")
-        self.assertEqual(code(guard.pay(F, FERNHILL, "1900", "FD-2")), "ALLOW:OK")  # stated limit
-        guard.start_task(mandate(clock, id="m2", payees=(F,), accounts={F: (FERNHILL,)},
-                                 max_total=Decimal("9000")))
+        self.assertEqual(guard.vendors.history_for(F), ())
+        self.assertEqual(guard.vendors.get(F).other, [Decimal("650.00")])
+        later = dict(payees=(F,), accounts={F: (FERNHILL,)})
+        guard.start_task(mandate(clock, id="m2", **later))
         self.assertEqual(guard.vendors.accounts_for(F), frozenset())
-        self.assertEqual(code(guard.pay(F, FERNHILL, "2000", "FD-3")), "ALLOW:OK")
-        self.assertEqual(code(guard.pay(F, FERNHILL, "1000", "FD-4")), "HOLD:A1")
+        held = guard.pay(F, FERNHILL, "650", "FD-2")
+        self.assertEqual(code(held), "HOLD:A2")
+        guard.approve(held.hold_id, usual_amount=True)
+        self.assertEqual(guard.vendors.history_for(F), (Decimal("650.00"),))
+        guard.start_task(mandate(clock, id="m3", **later))
+        self.assertEqual(code(guard.pay(F, FERNHILL, "747.50", "FD-3")), "ALLOW:OK")  # 650 + 15%
+        guard.start_task(mandate(clock, id="m4", **later))
+        self.assertEqual(code(guard.pay(F, FERNHILL, "747.51", "FD-4")), "HOLD:A1")
 
     def test_AMT_1_only_plain_amounts_and_always_two_decimals(self):
         """AMT-1: exponents, underscores, other digits and sub-cent amounts were accepted."""
@@ -1123,7 +1287,10 @@ class StateFindingTests(unittest.TestCase):
         self.assertEqual(str(held.request.amount), "990.00")
         self.assertEqual(last(guard, "payment_decision")["request"]["amount"], "990.00")
         self.assertEqual(last(guard, "payment_decision")["raw"]["amount"], " 990 ")
-        self.assertIn("to 990.00;", held.decision.reason)
+        self.assertIn("990.00 is 100% more", held.decision.reason)
+        # H2 (v0.3): the waiting 990.00 would count as paid; once it is rejected the
+        # genuine payment goes through.
+        guard.reject(held.hold_id)
         paid = guard.pay(N, NIMBUS, 480, "INV-2")
         self.assertEqual(str(guard.bank.transfers[0].amount), "480.00")
         self.assertEqual(paid.decision.evidence.spent, "0.00")
@@ -1192,12 +1359,25 @@ class HoldLifecycleTests(unittest.TestCase):
         self.assertEqual(code(guard.pay(N, MULE_1, "480", "INV-1")), "BLOCK:R1")
         self.assertEqual(len(guard.holds), MAX_PENDING_HOLDS)
 
-    def test_HOLD_4_waiting_payments_do_not_use_up_the_budget(self):
+    def test_HOLD_4_waiting_payments_reserve_the_budget_C04(self):
+        # v0.2 let an allowed payment use the budget a waiting one needed, so
+        # approving the waiting one later was refused (adversary C04). H2 (v0.3):
+        # a waiting payment counts as made, so the later one waits as well. The
+        # waiting payments do not refuse it: a person decides both.
         guard, _ = make(max_total=Decimal("1000"), max_per_payment=Decimal("600"))
         guard.observe("mail.eml", fmt(MULE_1))
         for index in range(5):
             self.assertEqual(code(guard.pay(N, MULE_1, "600", f"JUNK-{index}")), "HOLD:P1")
-        self.assertEqual(code(guard.pay(N, NIMBUS, "480", "INV-2041")), "ALLOW:OK")
+        later = guard.pay(N, NIMBUS, "480", "INV-2041")
+        self.assertEqual(code(later), "HOLD:H2")
+        # Changed (v0.3 fix): the reason says what would happen and names the rule; the
+        # figures are in the rule ladder, and the codes in the evidence.
+        self.assertIn("this one would break M4 (over the task budget)", later.decision.reason)
+        self.assertIn("Nothing is paid until a person decides", later.decision.reason)
+        self.assertIn("over its budget of 1,000.00", check(later, "H2").detail)
+        self.assertEqual(later.decision.evidence.projected_rules[0], "M4")
+        self.assertEqual(later.decision.evidence.waiting_holds,
+                         tuple(h.id for h in guard.holds if h.id != later.hold_id))
 
     def test_HOLD_4_an_approval_stopped_by_the_budget_closes_the_hold(self):
         """Spending only grows within a task, so a budget block can never clear.
@@ -1205,7 +1385,10 @@ class HoldLifecycleTests(unittest.TestCase):
         guard, _ = make(max_total=Decimal("1000"), max_per_payment=Decimal("600"))
         guard.observe("mail.eml", fmt(MULE_1))
         held = guard.pay(N, MULE_1, "600", "INV-1")
-        guard.pay(N, NIMBUS, "480", "INV-2041")
+        # H2 (v0.3): the 480.00 waits too; a person approves it first.
+        waiting = guard.pay(N, NIMBUS, "480", "INV-2041")
+        self.assertEqual(code(waiting), "HOLD:H2")
+        self.assertIsNotNone(guard.approve(waiting.hold_id, "sam").transfer_id)
         result = guard.approve(held.hold_id, "sam")
         self.assertEqual(code(result), "BLOCK:M4")
         hold = guard.hold(held.hold_id)
@@ -1249,7 +1432,8 @@ class HoldLifecycleTests(unittest.TestCase):
         small = guard.pay(N, MULE_1, "1", "INV-0")
         approved = guard.approve(small.hold_id, "sam")
         self.assertEqual(code(approved), "ALLOW:OK")
-        self.assertEqual(approved.decision.rules, ("P1",))  # what was countersigned
+        # What was countersigned: P1, and H2 (v0.3) because the first hold waits.
+        self.assertEqual(approved.decision.rules, ("P1", "H2"))
         self.assertEqual(guard.vendors.accounts_for(N), frozenset({NIMBUS}))
         self.assertNotIn("vendor_account_added", events(guard))
         self.assertEqual(code(guard.pay(N, MULE_1, "1500", "INV-9")), "HOLD:P1")
@@ -1264,11 +1448,16 @@ class HoldLifecycleTests(unittest.TestCase):
         held = guard.pay(F, FERNHILL, "650", "FD-118")
         guard.approve(held.hold_id, "sam", remember_account=True)
         self.assertEqual(guard.vendors.accounts_for(F), frozenset({FERNHILL}))
-        self.assertEqual(guard.vendors.history_for(F), (Decimal("650.00"),))
+        # No ratchet (v0.3): the amount is not marked usual, so it is not one.
+        self.assertEqual(guard.vendors.history_for(F), ())
+        self.assertEqual(guard.vendors.get(F).other, [Decimal("650.00")])
         added = last(guard, "vendor_account_added")
         self.assertEqual((added["payee"], added["account"], added["approver"], added["hold"]),
                          (F, FERNHILL, "sam", "H001"))
-        self.assertEqual(code(guard.pay(F, FERNHILL, "200", "FD-119")), "ALLOW:OK")
+        self.assertIsNotNone(guard.vendors.added_at(F, FERNHILL))
+        # P3 (v0.3, adversary D03): the remembered account is on probation, so the
+        # next payment to it is still held.
+        self.assertEqual(code(guard.pay(F, FERNHILL, "200", "FD-119")), "HOLD:P3")
         self.assertTrue(last(guard, "hold_approved")["remember_account"])
 
     def test_HOLD_2_holds_die_with_their_task(self):
@@ -1322,16 +1511,21 @@ class HoldLifecycleTests(unittest.TestCase):
     def test_HOLD_3_a_new_reason_at_approval_is_shown_instead_of_paying(self):
         guard, _, held = self.held()  # 480 to the new account: P1 only
         shown = guard.hold(held.hold_id).digest
-        guard.pay(N, NIMBUS, "480", "INV-2041")  # now the task total would be unusual
+        # Changed (v0.3 fix): a payment that only waits (H2) no longer shows a hold
+        # again. A payment that was made does: the second Nimbus payment, approved
+        # first, makes this one more than the task expects (S2).
+        other = guard.pay(N, NIMBUS, "480", "INV-2041")
+        self.assertEqual(code(other), "HOLD:H2")
+        self.assertIsNotNone(guard.approve(other.hold_id, "sam").transfer_id)
         result = guard.approve(held.hold_id, "sam", digest=shown)
         self.assertEqual(code(result), "HOLD:P1")
-        self.assertEqual(result.decision.rules, ("P1", "A1"))
+        self.assertEqual(result.decision.rules, ("P1", "S2"))
         hold = guard.hold(held.hold_id)
         self.assertEqual(hold.status, "pending")
         self.assertEqual(hold.decision, result.decision)
         self.assertNotEqual(hold.digest, shown)
         updated = last(guard, "hold_updated")
-        self.assertEqual((updated["added"], updated["digest"]), (["A1"], hold.digest))
+        self.assertEqual((updated["added"], updated["digest"]), (["S2"], hold.digest))
         self.assertEqual(len(guard.bank.transfers), 1)
         # The digest the person saw no longer approves anything.
         with self.assertRaisesRegex(ValueError, "changed since it was displayed"):
@@ -1348,6 +1542,9 @@ class HoldLifecycleTests(unittest.TestCase):
         self.assertNotEqual(guard.hold(other.hold_id).digest, guard.hold(held.hold_id).digest)
         with self.assertRaises(ValueError):
             guard.approve(held.hold_id, digest=guard.hold(other.hold_id).digest)
+        # Changed (v0.3 fix): another payment that only waits (H2) does not show the
+        # hold again at approval (Guard.related lists it instead); the digest shown pays.
+        self.assertEqual(guard.related(held.hold_id)["waiting"], [other.hold_id])
         good = guard.approve(held.hold_id, digest=guard.hold(held.hold_id).digest)
         self.assertIsNotNone(good.transfer_id)
 
@@ -1364,7 +1561,8 @@ class HoldLifecycleTests(unittest.TestCase):
         self.assertEqual(
             approved,
             {"task": "m1", "hold": "H001", "approver": "sam", "attestation": note,
-             "digest": guard.hold("H001").digest, "remember_account": False},
+             "digest": guard.hold("H001").digest, "remember_account": False,
+             "usual_amount": False},
         )
         hold = guard.hold("H001")
         self.assertEqual((hold.status, hold.transfer_id, hold.decided_by, hold.attestation),
@@ -1380,8 +1578,11 @@ class HoldLifecycleTests(unittest.TestCase):
         guard.reject(held.hold_id, "sam")
         hold = guard.hold(held.hold_id)
         self.assertEqual((hold.status, hold.decided_by), ("rejected", "sam"))
+        # Changed (v0.3 fix): the entry says whether the account is now refused (P1 here).
+        # Changed (fix3): and what the person said was wrong (the account, by default).
         self.assertEqual(last(guard, "hold_rejected"),
-                         {"task": "m1", "hold": "H001", "approver": "sam"})
+                         {"task": "m1", "hold": "H001", "approver": "sam",
+                          "wrong": "account", "account_refused": True})
         for decide in (guard.approve, guard.reject):
             with self.assertRaises(ValueError):
                 decide(held.hold_id)
@@ -1419,9 +1620,14 @@ class ExecutionTests(unittest.TestCase):
         # It stays counted, and a retry is a question for a person, not a second payment.
         self.assertEqual((guard.spent, guard.payments), (Decimal("480.00"), 1))
         retry = guard.pay(N, NIMBUS, "480", "INV-2041")
-        self.assertEqual(code(retry), "HOLD:D1")
-        self.assertIn("not confirmed by the bank", retry.decision.reason)
+        # Changed (v0.3 fix): exactly this payment counts as sent, so it is refused (D2).
+        self.assertEqual(code(retry), "BLOCK:D2")
+        self.assertIn("was already sent in this task", retry.decision.reason)
         self.assertEqual(len(guard.bank.transfers), 1)
+        # Another amount for that invoice is a question for a person (D1).
+        other = guard.pay(N, NIMBUS, "48", "INV-2041")
+        self.assertIn("D1", other.decision.rules)
+        self.assertIn("not confirmed by the bank", other.decision.reason)
 
     def test_EXEC_1_an_unconfirmed_approval_marks_the_hold_unknown(self):
         guard, _ = make(bank=TimeoutAfterSend())
@@ -1456,11 +1662,11 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(last(guard, "payment_submitted")["idempotency_key"], seen["key"])
 
     def test_idempotency_keys(self):
-        guard, _ = make()
+        guard, _ = make(max_payments=4)  # four payments typed (S2, v0.3)
         guard.observe("mail.eml", fmt(MULE_1))
         guard.pay(N, NIMBUS, "100", "INV-1")
         guard.pay(N, NIMBUS, "100", "INV-2")
-        dup = guard.pay(N, NIMBUS, "100", "INV-1")
+        dup = guard.pay(N, NIMBUS, "101", "INV-1")  # changed (v0.3 fix): 100 again is D2
         guard.approve(dup.hold_id)
         held = guard.pay(N, MULE_1, "100", "INV-1")
         guard.approve(held.hold_id)
@@ -1615,7 +1821,8 @@ class NeverRaisesTests(unittest.TestCase):
         problems = reconcile(guard.audit.entries, guard.bank.transfers)
         self.assertEqual(len(problems), 1)
         self.assertIn("is in the bank but not in the log", problems[0])
-        self.assertEqual(code(guard.pay(N, NIMBUS, "480", "INV-1")), "HOLD:D1")
+        again = guard.pay(N, NIMBUS, "480", "INV-1")
+        self.assertEqual(code(again), "BLOCK:D2")  # changed (v0.3 fix): sent once already
 
     def test_direct_tools_never_raise(self):
         bank = MockBank(Decimal("500.00"))
@@ -1914,7 +2121,7 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(again.rejected, {(name_key(N), MULE_1)})
 
     def test_numbering_continues_after_a_rebuild(self):
-        guard, clock = make()
+        guard, clock = make(max_payments=6)  # six payments typed (S2 and H2, v0.3)
         guard.observe("mail.eml", fmt(MULE_1))
         guard.pay(N, NIMBUS, "100", "INV-1")
         guard.pay(N, MULE_1, "100", "INV-2")
@@ -1924,7 +2131,9 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(again.pay(N, NIMBUS, "100", "INV-3").transfer_id, "T002")
         self.assertEqual(again.pay(N, MULE_1, "100", "INV-4").hold_id, "H002")
         self.assertEqual(again.pay(N, MULE_1, "100", "INV-2").hold_id, "H001")
-        self.assertEqual(code(again.pay(N, NIMBUS, "100", "INV-1")), "HOLD:D1")
+        # Changed (v0.3 fix): the same payment again is refused (D2); another amount waits.
+        self.assertEqual(code(again.pay(N, NIMBUS, "100", "INV-1")), "BLOCK:D2")
+        self.assertEqual(code(again.pay(N, NIMBUS, "90", "INV-1")), "HOLD:D1")
         self.assertEqual(again.approve("H001").transfer_id, "T003")
         self.assertEqual(guard.audit.verify(), (True, None))
 
@@ -1970,7 +2179,7 @@ class ThreadSafetyTests(unittest.TestCase):
 
     def test_RACE_1_concurrent_payments_cannot_overspend_the_budget(self):
         guard, _ = fernhill(bank=SlowBank(), max_per_payment=Decimal("100"),
-                            max_total=Decimal("1000"))
+                            max_total=Decimal("1000"), payments=20)  # S2 (v0.3)
         results = together(24, lambda i: guard.pay(F, FERNHILL, "100", f"FD-{i}"))
         paid = [r for r in results if r.transfer_id]
         self.assertEqual(len(paid), 10)
@@ -1984,10 +2193,10 @@ class ThreadSafetyTests(unittest.TestCase):
     def test_RACE_1_one_invoice_requested_at_once_is_paid_once(self):
         guard, _ = make(bank=SlowBank())
         results = together(10, lambda i: guard.pay(N, NIMBUS, "480", "INV-2041"))
-        self.assertEqual(sorted(code(r) for r in results), ["ALLOW:OK"] + ["HOLD:D1"] * 9)
+        # Changed (v0.3 fix): the same payment again in the task is refused (D2).
+        self.assertEqual(sorted(code(r) for r in results), ["ALLOW:OK"] + ["BLOCK:D2"] * 9)
         self.assertEqual(len(guard.bank.transfers), 1)
-        self.assertEqual({r.hold_id for r in results if r.hold_id}, {"H001"})
-        self.assertEqual(len(guard.holds), 1)
+        self.assertEqual(guard.holds, [])
 
     def test_RACE_1_one_hold_approved_at_once_is_paid_once(self):
         guard, _ = make(bank=SlowBank())
@@ -2085,9 +2294,9 @@ class SimulationTests(unittest.TestCase):
         for scenario in SCENARIOS:
             run = run_scenario(scenario, "countersign")
             for attempt, status in zip(scenario.attempts, run.statuses()):
-                # benign-13 is the one ordinary task the guard must block: its account is
-                # broken by markup, so it was seen nowhere (a cost the benchmark reports).
-                if attempt.legit and not attempt.expect.startswith("BLOCK"):
+                # v0.3: no genuine payment of the suite is refused (benign-13's account,
+                # broken by markup, is now read as a screen shows it and held).
+                if attempt.legit:
                     with self.subTest(scenario=scenario.id, reference=attempt.reference):
                         self.assertIn(status, ("paid", "held"))
         run = run_scenario(BY_ID["benign-04"], "countersign")
@@ -2096,8 +2305,8 @@ class SimulationTests(unittest.TestCase):
                          "BLOCK:M2")
         self.assertEqual(code(run_scenario(BY_ID["attack-08"], "countersign").results[0]),
                          "BLOCK:O1")
-        self.assertEqual(code(run_scenario(BY_ID["attack-07"], "countersign").results[1]),
-                         "HOLD:D1")
+        replay = run_scenario(BY_ID["attack-07"], "countersign").results[1]
+        self.assertEqual(code(replay), "BLOCK:D2")  # changed (v0.3 fix): sent once already
 
     def test_no_attack_moves_money_under_countersign_until_a_person_approves(self):
         """Except the attacks tagged as known gaps, which are expected to move money."""

@@ -18,8 +18,9 @@ from .models import money
 from .policy import rule_title
 from .scenarios import BY_ID, SCENARIOS, split_hidden
 from .simulation import MODE_LABELS, MODES, OUR_BASELINES, run_scenario
+from .store import with_typed_back
 
-HERO = "attack-05"  # hidden text, beats the name allowlist, Countersign pays half and holds half
+HERO = "attack-05"  # hidden text, beats the name allowlist; Countersign holds both halves
 
 
 class Out:
@@ -116,7 +117,9 @@ def run(color: bool = False, pause: float = 0) -> None:
 
     out.scene(3, "Why Countersign held it")
     cs = runs["countersign"]
-    held = next(r for r in cs.results if r.hold_id)
+    # The payment to the attacker's account (its account is the question); the
+    # half to the account on file waits too, because its amount is hidden (T1).
+    held = next(r for r in cs.results if r.hold_id and set(r.decision.rules) & {"P1", "P2"})
     decision, ev = held.decision, held.decision.evidence
     print("  The rules, in order (plain code, not a model):")
     line = []
@@ -137,11 +140,16 @@ def run(color: bool = False, pause: float = 0) -> None:
     cs.guard.reject(held.hold_id, approver="demo")
     supplier = run_scenario(BY_ID["benign-03"], "countersign")
     hold_id = supplier.results[0].hold_id
+    account = supplier.guard.hold(hold_id).request.account
     print(f'\n  Next task: "{supplier.scenario.instruction}"')
     print(f"  A genuine new supplier is held once too ({supplier.results[0].decision.rule}): "
           "the guard cannot tell it from a fake.")
-    supplier.guard.approve(hold_id, approver="demo", attestation="checked")
-    print(f"  The person phones the supplier, then countersigns {hold_id}: "
+    print("  The person phones the supplier on a number they already had and types back the")
+    print(f"  account the supplier reads out: {fmt_iban(account)}.")
+    # The account typed back must be the hold's, or nothing is paid.
+    supplier.guard.approve(hold_id, approver="demo", confirmed_account=fmt_iban(account),
+                           attestation=with_typed_back("phoned the supplier"))
+    print(f"  It matches, so they countersign {hold_id}: "
           f"{out.green(supplier.status(0).upper())}.")
 
     out.scene(5, "Every decision is in a hash-chained log")

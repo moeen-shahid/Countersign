@@ -45,6 +45,23 @@ function fill(node, ...children) {
   return add(node, children);
 }
 
+/** Run a re-render without losing the field the person is typing in. Fields that
+    must survive a re-render carry data-keep; their values live in the page state. */
+function keepFocus(render) {
+  const active = document.activeElement;
+  const key = active && active.dataset ? active.dataset.keep : null;
+  const sel = key && typeof active.selectionStart === "number" ? [active.selectionStart, active.selectionEnd] : null;
+  const out = render();
+  if (key) {
+    const again = [...document.querySelectorAll("[data-keep]")].find((n) => n.dataset.keep === key);
+    if (again && again !== document.activeElement) {
+      again.focus();
+      if (sel) { try { again.setSelectionRange(sel[0], sel[1]); } catch (err) { /* not a text field */ } }
+    }
+  }
+  return out;
+}
+
 class ApiError extends Error {
   constructor(status, message) {
     super(message);
@@ -132,6 +149,24 @@ function segButton(label, on, handler, title) {
 }
 
 const OUTCOME_CLASS = { ALLOW: "allow", HOLD: "hold", BLOCK: "block" };
+/** A document's name is the sender's words, never a fact or a heading: a document can be
+    named "Approved by finance.pdf" (adversary trace D04). Always quoted and labelled. */
+function docName(name) {
+  return el("span", { class: "doc-name", title: "The sender chose this name. It proves nothing." },
+    el("span", { class: "doc-name-label" }, "document named "),
+    el("span", { class: "mono" }, "\u201c" + name + "\u201d"));
+}
+/** The quarantines of a replay whose first refusal (H1) is already on screen. */
+function shownQuarantines(run, shown) {
+  return (run.quarantines || []).filter((q) => shown.some((a) => a.task === q.number && a.rule === "H1"));
+}
+const docNameText = (name) => "the document named \u201c" + name + "\u201d";
+/** The banner of a task whose queue overflowed (q.text comes from the server). */
+function quarantineBanner(q, where) {
+  return el("div", { class: "banner block quarantine", role: "status" },
+    where ? el("strong", {}, where.charAt(0).toUpperCase() + where.slice(1) + ": ") : null, q.text);
+}
+const ROUNDABOUT = "Not written as one piece: the guard read it through HTML tags or invisible characters";
 const CHECK_WORD = { pass: "pass", block: "BLOCK", hold: "HOLD", na: "does not apply", off: "not in this guard", skipped: "not reached" };
 
 /* ------------------------------------------------------------------ */
@@ -234,7 +269,9 @@ function openSheet(kind, title, render, opener) {
   $("sheet").hidden = false;
   render();
   const first = $("sheet-body").querySelector("[data-autofocus]");
-  (first || $("sheet-title")).focus();
+  /* Focus the default action without scrolling past what is above it (banners, the card's heading). */
+  (first || $("sheet-title")).focus({ preventScroll: true });
+  $("sheet-body").scrollTop = 0;
 }
 
 function closeSheet() {
@@ -321,13 +358,13 @@ function createViewer(emptyText) {
     const tabs = el("div", { class: "doc-tabs", role: "tablist", "aria-label": "Documents the agent read" },
       v.docs.map((d, i) => el("button", {
         type: "button", class: "doc-tab", role: "tab", "aria-selected": String(i === v.index),
-        onclick: () => v.select(i),
-      }, d.name, hiddenCount(d) ? el("span", { class: "tag tag-block" }, plural(hiddenCount(d), "hidden passage")) : null)));
+        onclick: () => v.select(i), title: "The sender chose this name",
+      }, "\u201c" + d.name + "\u201d", hiddenCount(d) ? el("span", { class: "tag tag-block" }, plural(hiddenCount(d), "hidden passage")) : null)));
     const views = el("div", { class: "seg", role: "group", "aria-label": "Document view (key X)" },
       segButton("Human view", v.mode === "human", () => v.setMode("human"), "Key X"),
       segButton("Agent view", v.mode === "agent", () => v.setMode("agent"), "Key X"));
     const paper = el("div", { class: "paper " + v.mode, tabindex: "0", role: "document",
-      "aria-label": doc.name + ", " + (v.mode === "human" ? "as a person sees it" : "as the agent reads it") },
+      "aria-label": docNameText(doc.name) + ", " + (v.mode === "human" ? "as a person sees it" : "as the agent reads it") },
       docNodes(doc, v.mode, v.payees));
     const hidden = hiddenCount(doc);
     const note = v.mode === "human"
@@ -377,10 +414,10 @@ function textPieces(doc, start, end, payees) {
     const b = Math.min(acc.end, end);
     if (a > pos) out.push(doc.text.slice(pos, a));
     const onFile = acc.on_file_for && payees.includes(nameKey(acc.on_file_for));
-    const title = onFile ? "On file for " + acc.on_file_for
+    const title = (onFile ? "On file for " + acc.on_file_for
       : acc.on_file_for ? "On file for " + acc.on_file_for + ", who is not a payee of this task"
-        : "Not on file for a payee of this task";
-    out.push(el("mark", { class: "acct " + (onFile ? "on-file" : "not-on-file"), title,
+        : "Not on file for a payee of this task") + (acc.rendered ? ". " + ROUNDABOUT : "");
+    out.push(el("mark", { class: "acct " + (onFile ? "on-file" : "not-on-file") + (acc.rendered ? " rendered" : ""), title,
       data: { start: String(acc.start), end: String(acc.end) } }, doc.text.slice(a, b)));
     pos = b;
   }
@@ -398,6 +435,7 @@ function currentViewer() {
 /* ---- 4b. Lanes: one per guard, with stations and animated payments ---- */
 
 function pillStatus(a) {
+  if (a.repeat && a.hold) return { cls: "joined", label: "JOINED " + a.hold.id };
   if (a.status === "paid") {
     const approved = a.hold && a.hold.status === "approved";
     return { cls: a.legit === false ? "lost" : "paid", label: approved ? "PAID, APPROVED" : "PAID" };
@@ -432,17 +470,35 @@ function createBoard(onSelect) {
     fill(b.root, S.meta.modes.filter((m) => b.runs[m.id]).map((m) => laneEl(m, b.runs[m.id])));
   };
 
+  const multi = () => Object.values(b.runs).some((r) => r.attempts.some((a) => a.task > 1));
+
   function pillBox(mode, a, withAccount) {
     const st = pillStatus(a);
     const selected = b.selected && b.selected.mode === mode && b.selected.index === a.index;
+    const many = multi();
     return el("div", { class: "pillbox" },
       el("button", {
         type: "button", class: "pill " + st.cls + (selected ? " selected" : ""),
-        "aria-label": "Payment " + (a.index + 1) + ": " + eur(a.amount) + " to " + groups(a.account) + ". " + st.label + ". Open evidence.",
+        "aria-label": "Payment " + (a.index + 1) + (many ? " (task " + a.task + ")" : "") + ": " + eur(a.amount) + " to " + groups(a.account) + ". " + st.label + ". Open evidence.",
         onclick: (ev) => onSelect(mode, a.index, ev.currentTarget),
-      }, el("span", {}, money(a.amount)), withAccount ? el("span", {}, tail(a.account)) : null,
+      }, many ? el("span", { class: "pill-t" }, "T" + a.task) : null,
+      el("span", {}, money(a.amount)), withAccount ? el("span", {}, tail(a.account)) : null,
       el("span", { class: "pill-st" }, st.label)),
       truthTag(a));
+  }
+
+  /** Pills grouped by task, each group led by its task's label (several tasks only), so a
+      label never wraps away from its pills. */
+  function pillGroups(mode, list, withAccount) {
+    if (!multi()) return list.map((a) => pillBox(mode, a, withAccount));
+    const groups = [];
+    for (const a of list) {
+      if (!groups.length || groups[groups.length - 1].task !== a.task) groups.push({ task: a.task, items: [] });
+      groups[groups.length - 1].items.push(a);
+    }
+    return groups.map((g) => el("span", { class: "task-group" },
+      el("span", { class: "task-div", "aria-hidden": "true" }, "Task " + g.task),
+      g.items.map((a) => pillBox(mode, a, withAccount))));
   }
 
   function pipEls(checks, idle) {
@@ -460,19 +516,20 @@ function createBoard(onSelect) {
     const mule = all ? cents(run.to_attacker) : bad.filter((a) => a.to_attacker).reduce((n, a) => n + cents(a.amount), 0);
     const pick = b.selected && b.selected.mode === m.id ? shown[b.selected.index] : null;
     const focus = pick || shown[shown.length - 1] || null;
-    const returned = shown.filter((a) => ["blocked", "rejected", "expired"].includes(a.status));
-    const held = shown.filter((a) => a.status === "held");
-    const paid = shown.filter((a) => a.status === "paid");
+    /* A repeat that joined a waiting hold stays with the agent: the hold it joined is the payment. */
+    const returned = shown.filter((a) => a.repeat || ["blocked", "rejected", "expired"].includes(a.status));
+    const held = shown.filter((a) => !a.repeat && a.status === "held");
+    const paid = shown.filter((a) => !a.repeat && a.status === "paid");
     const accounts = [...new Set(paid.map((a) => a.account))];
     const guarded = run.mandate !== null;
 
     const pips = el("div", { class: "pips" }, focus ? pipEls(focus.checks, false) : null);
     const verdict = el("span", { class: "verdict" }, focus && guarded ? "#" + (focus.index + 1) + " " + verdictText(focus) : "");
     const bay = el("div", { class: "bay" }, el("span", { class: "bay-label" }, "Hold bay"),
-      held.map((a) => pillBox(m.id, a, true)));
+      pillGroups(m.id, held, true));
     const agent = el("div", { class: "station st-agent" },
       el("div", { class: "st-label" }, "AGENT", el("small", {}, "scripted")),
-      el("div", { class: "pillboxes" }, returned.map((a) => pillBox(m.id, a, true))));
+      el("div", { class: "pillboxes" }, pillGroups(m.id, returned, true)));
     const guardBox = guarded
       ? el("div", { class: "station st-guard" }, el("div", { class: "st-label" }, "GUARD", verdict), pips, bay)
       : el("div", { class: "station st-guard none" }, el("div", { class: "st-label" }, "NO GUARD"),
@@ -482,7 +539,7 @@ function createBoard(onSelect) {
     const dest = el("div", { class: "station st-dest" }, el("div", { class: "st-label" }, "DESTINATIONS"),
       el("div", { class: "dests" }, accounts.map((account) => el("div", { class: "dest" },
         el("div", { class: "dest-acct", title: groups(account) }, mask(account)),
-        el("div", { class: "pillboxes" }, paid.filter((a) => a.account === account).map((a) => pillBox(m.id, a, false)))))));
+        el("div", { class: "pillboxes" }, pillGroups(m.id, paid.filter((a) => a.account === account), false))))));
     const track = el("div", { class: "track" }, agent, guardBox, bank, dest);
     b.lanes[m.id] = { track, agent, guard: guardBox, pips, verdict, bay, bank, dest, guarded };
 
@@ -492,6 +549,8 @@ function createBoard(onSelect) {
     },
     el("div", { class: "lane-head" },
       el("h3", {}, m.label), m.note ? el("span", { class: "tag" }, m.note) : null,
+      shownQuarantines(run, shown).map((q) => el("span", { class: "tag tag-block", title: q.text },
+        "QUARANTINED" + ((run.mandates || []).length > 1 ? " IN TASK " + q.number : ""))),
       el("div", { class: "counter" + (lost > 0 ? " bad" : "") },
         mule > 0 ? el("span", {}, eur(fromCents(mule)) + " to attacker-controlled accounts") : null,
         el("span", {}, "Unauthorised money moved"), el("b", {}, eur(fromCents(lost))))),
@@ -573,13 +632,21 @@ function outcomeBadge(a) {
 
 function statusSentence(a) {
   const h = a.hold;
+  if (a.repeat && h) {
+    return "Asked again for exactly the same payment while hold " + h.id + " waited. It joined that hold, so there is still one decision and at most one payment. The hold is now " + h.status + ".";
+  }
   if (a.status === "paid" && h && h.status === "approved") {
     return "A person approved this hold" + (h.attestation ? " (attestation: " + h.attestation + ")" : "") +
       ". The money was sent" + (a.transfer_id ? " as transfer " + a.transfer_id : "") + ".";
   }
   if (a.status === "paid") return "Paid" + (a.transfer_id ? " as transfer " + a.transfer_id : "") + ".";
   if (a.status === "held") return "Waiting for a person to countersign" + (h ? " (hold " + h.id + ")" : "") + ". Nothing has been paid.";
-  if (a.status === "rejected") return "A person rejected this hold. Nothing was paid.";
+  if (a.status === "rejected") {
+    return "A person rejected this hold. Nothing was paid." +
+      (h && h.account_refused ? " They said the account was wrong, so it is refused for this payee for the rest of the task." : "") +
+      (h && h.wrong === "payment" ? " They said only this payment was wrong, so the account was not refused." : "") +
+      (h && h.vendor_removed ? " It was also taken off the vendor file." : "");
+  }
   if (a.status === "expired") return "The hold expired with its task. Nothing was paid.";
   if (a.status === "unknown") return "The bank did not confirm this transfer. It may have been sent and needs a person to reconcile it.";
   return "Blocked. Nothing was paid.";
@@ -598,6 +665,8 @@ function evidenceNodes(a, ctx) {
     el("p", { class: "reason " + cls }, a.reason),
     el("p", {}, statusSentence(a)),
     a.note ? el("p", { class: "note" }, a.note) : null,
+    /* Right under the reason: a look-alike letter or a hidden figure is not visible in the lines above. */
+    a.found && a.found.length ? el("div", { class: "found-top" }, el("h3", {}, "What else the guard found"), foundList(a)) : null,
   ];
   if (a.legit != null) {
     nodes.push(el("div", { class: "truth-box" },
@@ -629,7 +698,7 @@ function evidenceNodes(a, ctx) {
         ev.dictated ? "You gave this account for this payee."
           : ev.typed_by_user ? "You typed this account, but not for a specific payee."
             : "You did not type this account.",
-        typed.map((s) => el("div", { class: "sighting" }, s.source + ", line " + s.line))),
+        typed.map((s) => el("div", { class: "sighting" }, "your instruction, line " + s.line))),
       row(onFile, "Vendor file for " + ev.payee,
         !ev.on_file.length ? "No account on file for this payee."
           : onFile ? "This is the account on file."
@@ -637,22 +706,43 @@ function evidenceNodes(a, ctx) {
         ev.on_file_for ? el("div", {}, "This account is on file for " + ev.on_file_for + ".") : null),
       row(docs.length > 0, "Documents the agent read (untrusted)",
         docs.length ? null : "Not in any document the agent read.",
-        docs.map((s) => el("div", { class: "sighting" },
-          el("span", { class: "mono" }, s.source), el("span", {}, "line " + s.line),
-          el("button", { type: "button", class: "btn tiny", onclick: () => ctx.show(s) }, "Show"))))));
+        docs.map((s) => el("div", {}, sightingNodes(s, ctx))))));
     if (!ev.sightings.length && !onFile && !ev.dictated) {
       nodes.push(el("p", { class: "banner block" }, "Nowhere. The guard has never seen this account" +
         (a.rules.includes("O1") ? ", so it refuses (O1)." : ".")));
     }
   }
-  const facts = ["This task when the decision was made: " + money(ev.spent) + " paid of a " + money(ev.budget) +
-    " budget, " + money(ev.paid_to_payee) + " of it to this payee."];
-  if (ev.history && ev.history.length) facts.push("Earlier payments on file: " + ev.history.map(money).join(", ") + " (largest " + money(ev.baseline) + ").");
-  else facts.push("No earlier payments on file for this payee.");
-  if (ev.previous_payment) facts.push("An earlier payment with this reference exists: " + Object.entries(ev.previous_payment).map(([k, v]) => k + " " + v).join(", ") + ".");
-  nodes.push(el("p", { class: "facts" }, facts.join(" ")),
-    el("p", { class: "note" }, "Decided by plain code, not by a model. Same request, same answer."));
+  nodes.push(el("h3", {}, "What the rules looked at (trusted state)"),
+    factsList(a) || el("p", { class: "note" }, "Nothing more to show."));
+  nodes.push(el("p", { class: "note" }, "Decided by plain code, not by a model. Same request, same answer."));
   return nodes;
+}
+
+/** One place an account was written, with the marker for an account split by markup. */
+function sightingNodes(s, ctx) {
+  return el("span", { class: "sighting" },
+    s.origin === "user" ? el("span", {}, "your instruction") : docName(s.source),
+    "line " + s.line, s.origin === "user" ? null : " (untrusted)",
+    s.rendered ? el("span", { class: "tag tag-block", title: ROUNDABOUT }, "not written as one piece") : null,
+    s.origin === "user" ? null : el("button", { type: "button", class: "btn tiny", onclick: () => ctx.show(s) }, "Show"));
+}
+
+/** Every rule a decision carries, with what it found: its line of the rule ladder. */
+function heldList(a) {
+  const rows = a.held && a.held.length ? a.held : (a.rules || []).map((rule) => ({ rule, title: "", detail: "" }));
+  return el("ul", { class: "held-rules" }, rows.map((r) => el("li", {},
+    el("span", { class: "tag " + (a.outcome === "BLOCK" ? "tag-block" : "tag-hold") }, r.rule + " " + (r.title || "")),
+    r.detail ? el("span", {}, " " + r.detail) : null)));
+}
+
+function factsList(a) {
+  return a.facts && a.facts.length ? el("ul", { class: "facts-list" }, a.facts.map((f) => el("li", {}, f))) : null;
+}
+
+/* What the rules of v0.3 found (hidden figures, a look-alike reference, another invoice with
+   the number you named, invoices your sentence left out, an amount above every usual one). */
+function foundList(a) {
+  return a.found && a.found.length ? el("ul", { class: "facts-list found" }, a.found.map((f) => el("li", {}, f))) : null;
 }
 
 function showSighting(viewer, sighting) {
@@ -672,26 +762,95 @@ function diffChars(mine, other) {
   return out;
 }
 
-/** ctx: { decide(id, action, body), show(sighting), instruction } */
+/** ctx: { key, decide(id, action, body), show(sighting), instruction(a), attempts }
+ *
+ * What a person must do depends on the hold (a.approval, from the server, which
+ * also enforces it): a hold about the account (P1, P2, P3) needs the whole account
+ * typed back as the vendor confirmed it; nothing here ever fills it in. A hold
+ * about the amount (A1, A2) offers "this is the new usual amount", in plain words.
+ */
 function holdCard(a, ctx) {
   const h = a.hold;
   const ev = a.evidence || { on_file: [], sightings: [] };
+  const ap = Object.assign({ typed_account: false, remember_account: false, usual_amount: null, rivals: [], waiting: [],
+    projected_rules: [], cleared: [], on_reject: "", reject_choices: [] }, a.approval || {});
+  /* How often the agent asked for exactly this payment: every repeat joined this hold. */
+  const asked = (ctx.attempts || []).filter((x) => x.hold && x.hold.id === h.id).length;
   /* Keyed by console, hold and digest: answers never carry over to another hold, or to
      the same hold once it is shown again with new reasons. */
   const key = ctx.key + ":" + h.id + ":" + h.digest;
-  const form = S.holdForm[key] || (S.holdForm[key] = { attestation: null, remember: false });
-  const onFile = ev.on_file[0];
-  const titles = a.rules.map((id) => {
-    const rule = S.meta.rules.find((r) => r.id === id);
-    return el("span", { class: "tag tag-hold" }, id + " " + (rule ? rule.title : ""));
+  const form = S.holdForm[key] || (S.holdForm[key] = { attestation: null, remember: false, usual: false, typed: "", wrong: null, error: "" });
+  /* A hold about the account is rejected only once the person says what was wrong. Nothing is chosen for them. */
+  const choices = ap.reject_choices || [];
+  /* The payee may have several accounts on file: compare with this payment's own when it is one of them. */
+  const onFile = ev.on_file.includes(a.account) ? a.account : ev.on_file[0];
+  const ready = () => (ap.typed_account ? form.typed.trim().length > 0 : !!form.attestation);
+  const body = () => {
+    const b = { digest: h.digest, remember_account: !!(ap.remember_account && form.remember),
+      usual_amount: !!(ap.usual_amount && form.usual) };
+    if (ap.typed_account) b.confirmed_account = form.typed;
+    else b.attestation = form.attestation;
+    return b;
+  };
+  const errorLine = form.error ? el("p", { class: "error", role: "alert" }, form.error) : null;
+  const decide = (action, payload) => guard(async () => {
+    form.error = "";
+    try {
+      await ctx.decide(h.id, action, payload());
+    } catch (err) {
+      /* Shown on the card itself, as well as in the toast: the card may have been redrawn. */
+      form.error = err.message || String(err);
+      rerenderHolds();
+      throw err;
+    }
   });
-  const approve = el("button", { type: "button", class: "btn", disabled: !form.attestation,
-    onclick: guard(() => ctx.decide(h.id, "approve", { digest: h.digest, attestation: form.attestation, remember_account: form.remember })),
-  }, "Countersign and pay");
+  const approve = el("button", { type: "button", class: "btn", disabled: !ready(), onclick: decide("approve", body) },
+    "Countersign and pay");
+  const reject = el("button", { type: "button", class: "btn strong", "data-autofocus": choices.length ? null : true,
+    disabled: choices.length > 0 && !form.wrong, onclick: decide("reject", () => (choices.length ? { wrong: form.wrong } : {})) }, "Reject");
+  const wrongBox = choices.length ? el("fieldset", { class: "attest reject-choice" },
+    el("legend", {}, "If you reject: what was wrong?"),
+    choices.map((c, i) => el("label", {},
+      el("input", { type: "radio", name: "wrong-" + key, value: c.wrong, checked: form.wrong === c.wrong,
+        "data-autofocus": i === 0 ? true : null,
+        onchange: () => { form.wrong = c.wrong; reject.disabled = false; } }),
+      el("span", {}, el("strong", {}, c.label + ". "), c.text))),
+    el("p", { class: "note" }, "Nothing is chosen for you. If you are not sure the account is the vendor's, choose the account.")) : null;
   const radio = (value, label) => el("label", {},
     el("input", { type: "radio", name: "attest-" + key, value, checked: form.attestation === value,
-      onchange: () => { form.attestation = value; approve.disabled = false; } }), label);
+      onchange: () => { form.attestation = value; approve.disabled = !ready(); } }), label);
   const docs = ev.sightings.filter((s) => s.origin !== "user");
+
+  let confirm;
+  if (ap.typed_account) {
+    const input = el("input", { type: "text", class: "mono typed-account", autocomplete: "off", spellcheck: "false",
+      autocapitalize: "characters", "data-keep": key + ":typed", "aria-describedby": "how-" + key,
+      oninput: (e) => { form.typed = e.target.value; approve.disabled = !ready(); } });
+    input.value = form.typed; /* what this person typed before a re-render; never the hold's account */
+    confirm = el("fieldset", { class: "attest confirm" },
+      el("legend", {}, "Confirm the account with the vendor"),
+      el("p", { class: "small", id: "how-" + key },
+        "Ask " + a.payee + " for their account through a channel you already trusted before this payment: a phone number or a contact you already had, not one from the invoice, an email or the agent. ",
+        "Type the whole account they give you. It is compared with this payment's account in full, because a look-alike account can share its first and last characters with the real one."),
+      el("label", { class: "field" }, el("span", {}, "Account the vendor confirmed"), input),
+      el("p", { class: "note" }, "If the vendor gives you a different account, do not change anything here: reject this payment."));
+  } else {
+    confirm = el("fieldset", { class: "attest" }, el("legend", {}, "Before you countersign"),
+      radio("checked", "I checked with the vendor using contact details I already had"),
+      radio("not checked", "I have not checked"),
+      el("p", { class: "note" }, "Your answer is written to the audit log. It is an accountability trail, not verification."));
+  }
+  const usual = ap.usual_amount;
+  const usualBox = usual ? el("fieldset", { class: "attest" }, el("legend", {}, "The amount"),
+    el("label", {}, el("input", { type: "checkbox", checked: form.usual, onchange: (e) => { form.usual = e.target.checked; } }),
+      "This is the new usual amount for " + a.payee + " (" + eur(usual.amount) + ")"),
+    el("p", { class: "note" }, usual.text),
+    el("p", { class: "small" }, "Line for one invoice from the next task on: ",
+      el("b", { class: "num" }, usual.now ? eur(usual.now) : "none, so a payment is held unless the sentence states an amount (A2)"), " without the mark, ",
+      el("b", { class: "num" }, eur(usual.after)), " with it.")) : null;
+  const remember = ap.remember_account ? el("label", { class: "remember" },
+    el("input", { type: "checkbox", checked: form.remember, onchange: (e) => { form.remember = e.target.checked; } }),
+    "Also add this account to the vendor file for " + a.payee + ". Payments to it are still held until you countersign one on a later day (P3).") : null;
 
   return el("article", { class: "hold-card", "aria-label": "Hold " + h.id },
     el("h4", {}, a.rule_title || "Held for countersignature"),
@@ -699,33 +858,66 @@ function holdCard(a, ctx) {
       el("strong", {}, a.payee), el("span", { class: "amt" }, eur(a.amount)),
       el("span", { class: "muted" }, "reference " + a.reference), el("span", { class: "tag" }, h.id)),
     el("div", { class: "cmp" },
-      el("span", { class: "lab" }, "On file"),
+      el("span", { class: "lab" }, ev.on_file.length > 1 ? "On file (" + (ev.on_file.indexOf(onFile) + 1) + " of " + ev.on_file.length + ")" : "On file"),
       el("span", { class: "val" }, onFile ? diffChars(onFile, a.account) : "No account on file for this payee."),
       el("span", { class: "lab" }, "This payment"),
       el("span", { class: "val" }, onFile ? diffChars(a.account, onFile) : groups(a.account))),
     onFile && onFile.slice(0, 2) !== a.account.slice(0, 2)
       ? el("p", { class: "note" }, "Country code differs: " + onFile.slice(0, 2) + " on file, " + a.account.slice(0, 2) + " in this payment.") : null,
-    onFile ? el("p", { class: "note" }, "Characters that differ are marked.") : null,
-    el("div", { class: "row" }, el("span", { class: "field-label" }, "Why it is held:"), titles),
+    onFile && onFile !== a.account ? el("p", { class: "note" }, "Characters that differ are marked.") : null,
+    el("div", { class: "field-label" }, "Why it is held:"), heldList(a),
     el("p", { class: "reason hold" }, a.reason),
-    el("p", { class: "small" }, el("span", { class: "field-label" }, "You asked: "), ctx.instruction || ""),
+    relatedNodes(ap),
+    asked > 1 ? el("p", { class: "note" }, el("span", { class: "tag" }, "asked " + asked + " times"),
+      " The agent asked for exactly this payment " + asked + " times. Every repeat joined this hold: one decision, and at most one payment.") : null,
+    el("p", { class: "small" }, el("span", { class: "field-label" }, "You asked: "),
+      (typeof ctx.instruction === "function" ? ctx.instruction(a) : ctx.instruction) || ""),
     el("div", { class: "small" }, el("span", { class: "field-label" }, "Where the account was read: "),
-      docs.length ? docs.map((s) => el("span", { class: "sighting" },
-        el("span", { class: "mono" }, s.source), "line " + s.line, " (untrusted)",
-        el("button", { type: "button", class: "btn tiny", onclick: () => ctx.show(s) }, "Show")))
-        : ev.typed_by_user ? "in your own instruction." : "in no document."),
-    el("fieldset", { class: "attest" }, el("legend", {}, "Before you countersign"),
-      radio("checked", "I checked with the vendor using contact details I already had"),
-      radio("not checked", "I have not checked"),
-      el("label", {}, el("input", { type: "checkbox", checked: form.remember,
-        onchange: (e) => { form.remember = e.target.checked; } }),
-      "Also add this account to the vendor file for " + a.payee),
-      el("p", { class: "note" }, "Your answer is written to the audit log. It is an accountability trail, not verification.")),
-    el("div", { class: "hold-actions" },
-      el("button", { type: "button", class: "btn strong", "data-autofocus": true,
-        onclick: guard(() => ctx.decide(h.id, "reject", {})) }, "Reject"),
-      approve,
-      el("span", { class: "note" }, "Reject is the default. Countersign needs an answer above.")));
+      docs.length ? docs.map((s) => sightingNodes(s, ctx))
+        : ev.typed_by_user ? "in your own instruction."
+          : ev.on_file.includes(a.account) ? "nowhere needed: it is the account on file for " + a.payee + "." : "in no document."),
+    el("details", { class: "facts-box", open: true }, el("summary", {}, "What the rules looked at (trusted state)"), factsList(a)),
+    a.found && a.found.length ? el("details", { class: "facts-box found-box", open: true }, el("summary", {}, "What else the guard found"), foundList(a)) : null,
+    confirm, usualBox, remember, wrongBox,
+    errorLine,
+    el("div", { class: "hold-actions" }, reject, approve,
+      el("span", { class: "note" }, choices.length ? "To reject, say what was wrong above. To countersign, type the account above."
+        : "Reject is the default. Countersign needs an answer above.")),
+    ap.on_reject && !choices.length ? el("p", { class: "note on-reject" }, el("span", { class: "field-label" }, "If you reject: "), ap.on_reject) : null);
+}
+
+/** What the guard says about the other waiting payments now (not when the hold was made). */
+function relatedNodes(ap) {
+  const out = [];
+  if (ap.rivals.length) {
+    out.push(el("p", { class: "banner hold" }, "Decide together with " + ap.rivals.join(", ") +
+      ": another account is waiting for the same invoice (D3), and at most one of them can be right."));
+  }
+  if (ap.waiting.length) {
+    out.push(el("div", { class: "small related" },
+      el("span", { class: "field-label" }, "Waiting payments it depends on (H2): "), ap.waiting.join(", ") + ".",
+      ap.projected_rules.length ? [" If " + (ap.waiting.length === 1 ? "it were" : "they were") + " paid, this one would break: ",
+        el("span", { class: "rule-tags" }, ap.projected_rules.map((r) => el("span", { class: "tag tag-hold", title: r.title }, r.rule + " " + r.title)))] : null,
+      " Decide " + (ap.waiting.length === 1 ? "it" : "them") + " first, or together with this one."));
+  }
+  if (ap.refused && ap.refused.length) {
+    out.push(el("p", { class: "banner block" }, "Would now be refused: ",
+      el("span", { class: "rule-tags" }, ap.refused.map((r) => el("span", { class: "tag tag-block", title: r.title }, r.rule + " " + r.title))),
+      " Approving it would pay nothing; reject it, or ask the agent again once you have checked."));
+  }
+  if (ap.cleared.length) {
+    out.push(el("p", { class: "note cleared" }, el("span", { class: "tag tag-allow" }, "no longer applies: " + ap.cleared.join(", ")),
+      " The waiting payment " + (ap.cleared.length === 1 ? "this reason was" : "these reasons were") + " about has been decided since this hold was made."));
+  }
+  return out.length ? el("div", { class: "related-box" }, el("span", { class: "field-label" }, "Now, with the other waiting payments:"), out) : null;
+}
+
+/** Draw every place a hold card is shown again, keeping the field being typed in. */
+function rerenderHolds() {
+  keepFocus(() => {
+    if (S.view === "live" && live.built) renderLive();
+    if (S.sheet && S.sheet.kind !== "limits") S.sheet.render();
+  });
 }
 
 function decidedLine(a) {
@@ -735,7 +927,10 @@ function decidedLine(a) {
     el("span", { class: "tag " + cls }, h.id + " " + h.status),
     el("span", {}, a.payee + ", " + eur(a.amount)), el("span", { class: "mono" }, mask(a.account)),
     h.decided_by ? el("span", { class: "muted" }, "by " + h.decided_by) : null,
-    h.attestation ? el("span", { class: "muted" }, "attestation: " + h.attestation) : null);
+    h.attestation ? el("span", { class: "muted" }, "attestation: " + h.attestation) : null,
+    h.account_refused ? el("span", { class: "tag tag-block" }, "account refused for the rest of the task") : null,
+    h.wrong === "payment" ? el("span", { class: "tag" }, "only this payment was wrong") : null,
+    h.vendor_removed ? el("span", { class: "tag tag-block" }, "taken off the vendor file") : null);
 }
 
 /** Attempts that carry a hold, one per hold id. */
@@ -757,22 +952,27 @@ function goneBanner() {
 /** Which holds the inbox shows depends on the view: the live session or the lab's Countersign run. */
 function inboxSource() {
   if (S.view === "live" && live.state) {
-    return { attempts: live.state.attempts, ctx: liveHoldCtx(), where: "live session" };
+    const task = live.state.task;
+    return { attempts: live.state.attempts, ctx: liveHoldCtx(), where: "live session",
+      quarantines: task && task.quarantine ? [task.quarantine] : [] };
   }
   const run = csRun();
-  return { attempts: run ? run.attempts : [], ctx: labHoldCtx(), where: "Countersign run" };
+  return { attempts: run ? run.attempts : [], ctx: labHoldCtx(), where: "Countersign run",
+    quarantines: run ? (run.quarantines || []).map((q) => Object.assign({ where: (run.mandates || []).length > 1 ? "task " + q.number : "" }, q)) : [] };
 }
 
 function inboxNodes(source) {
   const holds = holdsOf(source.attempts);
   const pending = holds.filter((a) => a.hold.status === "pending");
   const decided = holds.filter((a) => a.hold.status !== "pending");
+  const ctx = Object.assign({}, source.ctx, { attempts: source.attempts });
   return [
     el("p", { class: "tools-chip" }, "Agent tools: ", el("span", { class: "mono" }, S.meta.agent_tools.join(", ")),
       ". The agent has no approve tool. A person decides here."),
+    (source.quarantines || []).map((q) => quarantineBanner(q, q.where)),
     goneBanner(),
     pending.length ? null : el("p", { class: "empty" }, "No payment is waiting for a countersignature in the " + source.where + "."),
-    pending.map((a) => holdCard(a, source.ctx)),
+    pending.map((a) => holdCard(a, ctx)),
     decided.length ? el("h3", {}, "Decided") : null,
     decided.map(decidedLine),
   ];
@@ -801,13 +1001,20 @@ async function decideHold(path, id, action, body, { attempts, apply, refresh }) 
   const after = holdsOf(attempts(state)).find((a) => a.hold.id === id);
   S.lastApproval = action === "approve" && after && after.status === "paid" ? { amount: after.amount, legit: after.legit } : null;
   if (action === "approve" && after && after.status !== "paid") toast("Not paid: " + after.reason);
+  if (action === "reject" && after) {
+    toast("Rejected " + id + ". Nothing was paid." +
+      (after.hold.account_refused ? " This account is refused for " + after.payee + " for the rest of the task."
+        : after.hold.wrong === "payment" ? " Only this payment is refused; the account was not refused."
+          : " This same payment is refused for the rest of the task.") +
+      (after.hold.vendor_removed ? " It was also taken off the vendor file." : ""));
+  }
   apply(state);
 }
 
 function labHoldCtx() {
   return {
     key: "lab",
-    instruction: S.lab.scenario ? S.lab.scenario.instruction : "",
+    instruction: (a) => (labTask(a.task) || {}).instruction || "",
     show: (s) => showSighting(currentViewer(), s),
     decide: (id, action, body) => decideHold("/api/holds/", id, action, body, {
       attempts: (state) => state.runs.countersign.attempts,
@@ -817,18 +1024,34 @@ function labHoldCtx() {
   };
 }
 
+/** One task of the lab's scenario: { number, instruction, documents, ... }. */
+function labTask(number) {
+  const sc = S.lab.scenario;
+  if (!sc) return null;
+  const tasks = sc.tasks || [{ number: 1, instruction: sc.instruction, documents: sc.documents, gap_hours: 0 }];
+  return tasks[(number || 1) - 1] || tasks[0];
+}
+
 function openEvidence(mode, index, opener) {
   const board = S.view === "playground" ? pg.board : stage.board;
   if (board) { board.selected = { mode, index }; board.render(); }
+  const several = S.lab.scenario && (S.lab.scenario.tasks || []).length > 1;
   const render = () => {
     const run = S.lab.runs[mode];
     const a = run && run.attempts[index];
     if (!a) return closeSheet();
-    return fill($("sheet-body"), evidenceNodes(a, { guardLabel: run.mode_label, show: (s) => showSighting(currentViewer(), s) }),
+    const show = (s) => {
+      /* The account was read in the documents of this payment's task. */
+      if (S.view === "stage" && several) stageShowTask(a.task);
+      showSighting(currentViewer(), s);
+    };
+    return fill($("sheet-body"), evidenceNodes(a, { guardLabel: run.mode_label, show }),
       a.hold && a.hold.status === "pending"
         ? el("p", {}, el("button", { type: "button", class: "btn", onclick: openInbox }, "Open the Countersign inbox")) : null);
   };
-  openSheet("evidence", "Evidence: payment " + (index + 1) + ", " + modeInfo(mode).label, render, opener);
+  const run = S.lab.runs[mode];
+  const a = run && run.attempts[index];
+  openSheet("evidence", "Evidence: payment " + (index + 1) + (several && a ? " (task " + a.task + ")" : "") + ", " + modeInfo(mode).label, render, opener);
 }
 
 /** Every lab response goes through here so all views stay in step. */
@@ -839,23 +1062,32 @@ function setLab(state, fromTamper) {
   if (pg.built) renderPgResults();
   if (S.view === "audit") renderAudit();
   updateInboxCount();
-  if (S.sheet) S.sheet.render();
+  if (S.sheet) keepFocus(S.sheet.render);
 }
 
 /* ------------------------------------------------------------------ */
 /* 5. Stage                                                            */
 /* ------------------------------------------------------------------ */
 
-const stage = { built: false, loading: false, pos: 0, playing: false, busy: false, speed: 1, token: { cancelled: false }, board: null, viewer: null, ui: {} };
+const stage = { built: false, loading: false, pos: 0, playing: false, busy: false, speed: 1, token: { cancelled: false }, board: null, viewer: null, ui: {}, task: 1 };
+const KIND_LABEL = { benign: "ordinary tasks", attack: "attacks" };
+const suiteLabel = (id) => id.charAt(0).toUpperCase() + id.slice(1);
+
+function scenarioOption(s) {
+  return el("option", { value: s.id }, s.id + "  " + s.title + (s.tasks > 1 ? "  [" + s.tasks + " tasks]" : "") + (s.known_gap ? "  [known gap]" : ""));
+}
 
 function buildStage() {
   const ui = stage.ui;
   stage.viewer = createViewer("Pick a scenario to see what the agent read.");
   stage.board = createBoard(openEvidence);
   ui.select = el("select", { class: "scenario", "aria-label": "Scenario", onchange: guard(() => loadScenario(ui.select.value)) });
-  for (const [kind, label] of [["benign", "Ordinary tasks"], ["attack", "Attacks"]]) {
-    ui.select.append(el("optgroup", { label }, S.meta.scenarios.filter((s) => s.kind === kind).map((s) =>
-      el("option", { value: s.id }, s.id + "  " + s.title + (s.known_gap ? "  [known gap]" : "")))));
+  /* Grouped by suite (who wrote it), then ordinary tasks before attacks. */
+  for (const suite of S.meta.suites || [{ id: "standard", note: "" }]) {
+    for (const kind of ["benign", "attack"]) {
+      const list = S.meta.scenarios.filter((s) => (s.suite || "standard") === suite.id && s.kind === kind);
+      if (list.length) ui.select.append(el("optgroup", { label: suiteLabel(suite.id) + ": " + KIND_LABEL[kind] }, list.map(scenarioOption)));
+    }
   }
   ui.custom = el("option", { value: "custom" }, "custom  written in the playground");
   ui.tags = el("span", { class: "row" });
@@ -867,6 +1099,7 @@ function buildStage() {
       el("option", { value, selected: value === "1" }, label)));
   ui.user = el("div", {});
   ui.caption = el("p", { class: "caption", role: "status", "aria-live": "polite" });
+  ui.notice = el("div", { class: "stage-notice" });
   fill($("view-stage"),
     el("div", { class: "strip" },
       el("button", { type: "button", class: "btn", "aria-label": "Previous scenario", onclick: guard(() => stageNeighbour(-1)) }, "Prev"),
@@ -879,7 +1112,7 @@ function buildStage() {
       el("div", { class: "stage-left" },
         el("section", { class: "panel" }, el("h2", {}, "The user (trusted)"), ui.user),
         el("section", { class: "panel docs" }, el("h2", {}, "What the agent read (untrusted)"), stage.viewer.root)),
-      el("div", { class: "stage-right" }, stage.board.root, ui.caption,
+      el("div", { class: "stage-right" }, stage.board.root, ui.notice, ui.caption,
         el("p", { class: "legend" }, "The agent is scripted: it attempts every payment the attacker wants. Dashed tags (",
           el("span", { class: "truth" }, "the user wanted this"), " / ", el("span", { class: "truth unwanted" }, "the user did not want this"),
           ") are ground truth: known to the benchmark, never to the guard."))));
@@ -919,6 +1152,7 @@ async function loadScenario(id, options) {
   S.holdForm = {};
   S.tamper = { stage: null, truncated: false };
   stage.pos = 0;
+  stage.task = 1;
   stage.board.selected = null;
   stage.board.outlined = opts.outline || null;
   stage.viewer.index = 0;
@@ -934,49 +1168,136 @@ function stageNeighbour(delta) {
   return loadScenario(ids[(at + delta + ids.length) % ids.length]);
 }
 
-function stageSteps() {
+function stageTasks() {
   const sc = S.lab.scenario;
   if (!sc) return [];
-  const n = Math.max(0, ...Object.values(S.lab.runs).map((r) => r.attempts.length));
-  return [...sc.documents.map((d, i) => ({ type: "doc", i })), ...Array.from({ length: n }, (unused, i) => ({ type: "attempt", i }))];
+  return sc.tasks && sc.tasks.length ? sc.tasks : [{ number: 1, instruction: sc.instruction, documents: sc.documents, gap_hours: 0 }];
 }
 
-function mandateChips(runs) {
-  const m = Object.values(runs).map((r) => r.mandate).find(Boolean);
+/** Every step of the replay, task by task: a divider where a task starts (several tasks
+    only), the documents the agent reads, then the payments it asks for. */
+function stageSteps() {
+  const tasks = stageTasks();
+  if (!tasks.length) return [];
+  const runs = Object.values(S.lab.runs);
+  const longest = runs.reduce((best, r) => (r.attempts.length > best.length ? r.attempts : best), []);
+  const steps = [];
+  for (const t of tasks) {
+    if (tasks.length > 1) steps.push({ type: "task", t: t.number });
+    t.documents.forEach((d, i) => steps.push({ type: "doc", t: t.number, i }));
+    longest.forEach((a, i) => { if ((a.task || 1) === t.number) steps.push({ type: "attempt", t: t.number, i }); });
+  }
+  return steps;
+}
+
+const attemptsBefore = (steps, pos) => steps.slice(0, pos).filter((s) => s.type === "attempt").length;
+
+/** The task the Stage shows on the left: the one of the step being played or last played. */
+function stepTask(steps) {
+  const at = Math.min(stage.pos, steps.length);
+  const step = stage.busy ? steps[at] : steps[at - 1];
+  return step ? step.t : 1;
+}
+
+/** Show one task's sentence, mandate and documents on the left. */
+function stageShowTask(number) {
+  if (stage.task === number) return;
+  stage.task = number;
+  stage.viewer.index = 0;
+  renderStageLeft();
+}
+
+function mandateChips(m) {
   if (!m) return [];
   const chip = (label, value) => el("span", { class: "chip" }, label + " ", el("b", {}, value));
   const accounts = Object.entries(m.accounts || {}).flatMap(([payee, list]) => list.map((a) => chip("account you gave for " + payee, groups(a))));
+  /* What the task expects per payee (S1, S2, S3): one payment unless the sentence or the person said more. */
+  const asks = m.payees.map((p) => {
+    const ask = (m.asks || {})[p] || {};
+    const n = ask.payments || 1;
+    return [chip(p, n + (n === 1 ? " payment" : " payments") + (ask.payments ? "" : " (default)") +
+        (ask.instalments && n > 1 ? ", instalments of one invoice" : "")),
+      ask.amount ? chip(p + " at most", money(ask.amount)) : null,
+      (ask.invoices || []).map((r) => chip(p + " invoice", r)),
+      /* S4: the sentence leaves some of this payee's invoices out. */
+      ask.excludes_some ? el("span", { class: "chip chip-hold", title: "Every payment to " + p + " waits for you, unless its invoice is one your sentence names to pay (S4)." },
+        p + " ", el("b", {}, "some invoices not to be paid")) : null];
+  });
   return [
     m.payees.map((p) => chip("payee", p)),
     chip("per payment up to", money(m.max_per_payment)), chip("task budget", money(m.max_total)),
     chip("expires", String(m.expires_at).replace("T", " ").slice(0, 16) + " UTC"),
     m.max_payments ? chip("payments allowed", String(m.max_payments)) : null,
-    (m.references || []).map((r) => chip("invoice", r)), accounts,
+    (m.references || []).map((r) => chip("invoice", r)), accounts, asks,
   ];
 }
 
+/** The mandate of task `number` (from 1) in the lab, from any guarded run. */
+function labMandate(number) {
+  for (const r of Object.values(S.lab.runs)) {
+    const list = r.mandates && r.mandates.length ? r.mandates : r.mandate ? [r.mandate] : [];
+    if (list[number - 1]) return list[number - 1];
+  }
+  return null;
+}
+
+const gapText = (hours) => (hours >= 48 ? Math.round(hours / 24) + " days" : hours + " hours");
+
+/** One task's payees and limits, as the person confirmed them for that task. */
+function taskTerms(t) {
+  const m = labMandate(t.number) || {};
+  const payees = t.payees || m.payees || [];
+  const per = t.max_per_payment || m.max_per_payment;
+  const total = t.max_total || m.max_total;
+  return payees.join(", ") + (per ? "; up to " + money(per) + " a payment" : "") + (total ? ", " + money(total) + " in all" : "");
+}
+
 function captionNodes(steps) {
-  const sc = S.lab.scenario;
   const at = Math.min(stage.pos, steps.length);
   const step = stage.busy ? steps[at] : steps[at - 1];
   const out = [];
   if (!step) {
     out.push("Ready. Play replays the recorded attempts under every guard at once. The animation is replay pacing, not decision time. Click a payment for its evidence.");
+  } else if (step.type === "task") {
+    const t = labTask(step.t);
+    out.push(el("span", { class: "task-start" }, "Task " + step.t + " of " + stageTasks().length), " ",
+      step.t > 1 ? "starts " + gapText(t.gap_hours) + " later, on the same guard, bank and vendor file. Payments still waiting from the task before expire. " : "",
+      "The user confirms a new mandate for " + taskTerms(t) + ": “" + t.instruction + "”");
   } else if (step.type === "doc") {
-    out.push("The scripted agent reads " + sc.documents[step.i].name + ". Everything in it was written by the sender.");
+    out.push("The scripted agent reads " + docNameText(labTask(step.t).documents[step.i].name) + ". Everything in it, the name included, was written by the sender.");
   } else {
     const parts = S.meta.modes.filter((m) => S.lab.runs[m.id] && S.lab.runs[m.id].attempts[step.i]).map((m) => {
       const a = S.lab.runs[m.id].attempts[step.i];
       return m.label + ": " + (stage.busy ? verdictText(a) : pillStatus(a).label) + ".";
     });
     const a = Object.values(S.lab.runs).map((r) => r.attempts[step.i]).find(Boolean);
-    out.push("Payment " + (step.i + 1) + ": " + eur(a.amount) + " to " + mask(a.account) + " for " + a.payee + ". " + parts.join(" "));
+    const several = stageTasks().length > 1;
+    out.push("Payment " + (step.i + 1) + (several ? " (task " + step.t + ")" : "") + ": " + eur(a.amount) + " to " + mask(a.account) + " for " + a.payee + ". " + parts.join(" "));
   }
   if (S.lastApproval && S.lastApproval.legit === false && at >= steps.length) {
     out.push(el("span", { class: "gone" }, "A person approved a held payment. " + eur(S.lastApproval.amount) +
       " is gone. Holds only work if someone checks."));
   }
   return out;
+}
+
+function renderStageLeft() {
+  const ui = stage.ui;
+  const tasks = stageTasks();
+  const t = labTask(stage.task) || tasks[0];
+  if (!t) return;
+  const m = labMandate(t.number);
+  fill(ui.user,
+    /* Each task's own payees and limits: a later task can pay other people, or less. */
+    tasks.length > 1 ? el("ol", { class: "task-strip", "aria-label": "Tasks of this scenario" }, tasks.map((x) =>
+      el("li", { class: x.number === t.number ? "on" : "" },
+        el("button", { type: "button", "aria-pressed": String(x.number === t.number), onclick: () => stageShowTask(x.number),
+          title: x.instruction }, "Task " + x.number),
+        x.number > 1 ? el("span", { class: "muted small" }, " +" + gapText(x.gap_hours)) : null,
+        el("span", { class: "task-terms" }, taskTerms(x))))) : null,
+    el("p", { class: "quote" }, "“" + t.instruction + "”"),
+    el("div", { class: "chips" }, mandateChips(m)));
+  stage.viewer.set(t.documents, m ? m.payees : []);
 }
 
 function renderStage() {
@@ -992,15 +1313,18 @@ function renderStage() {
   const meta = S.meta.scenarios.find((s) => s.id === sc.id);
   fill(ui.tags,
     el("span", { class: "tag " + (sc.kind === "attack" ? "tag-block" : "tag-allow") }, sc.kind === "attack" ? "attack" : "ordinary task"),
-    sc.known_gap ? el("span", { class: "tag tag-gap" }, "known gap") : null,
+    sc.tasks && sc.tasks.length > 1 ? el("span", { class: "tag" }, sc.tasks.length + " tasks") : null,
+    sc.known_gap ? el("span", { class: "tag tag-gap", title: sc.miss_reason || "" }, "known gap") : null,
     meta && meta.hidden_text ? el("span", { class: "tag" }, "hidden text") : null);
   ui.summary.textContent = sc.summary;
   ui.summary.title = sc.summary;
-  fill(ui.user, el("p", { class: "quote" }, "“" + sc.instruction + "”"),
-    el("div", { class: "chips" }, mandateChips(S.lab.runs)));
-  const m = Object.values(S.lab.runs).map((r) => r.mandate).find(Boolean);
-  stage.viewer.set(sc.documents, m ? m.payees : []);
-  stage.board.set(S.lab.runs, Math.max(0, stage.pos - sc.documents.length));
+  stage.task = stepTask(steps);
+  renderStageLeft();
+  const shown = attemptsBefore(steps, stage.pos);
+  stage.board.set(S.lab.runs, shown);
+  const cs = csRun();
+  fill(ui.notice, cs ? shownQuarantines(cs, cs.attempts.slice(0, shown)).map((q) =>
+    quarantineBanner(q, (cs.mandates || []).length > 1 ? "task " + q.number : "")) : null);
   fill(ui.caption, captionNodes(steps));
   ui.play.textContent = stage.playing ? "Pause" : stage.pos >= steps.length && steps.length ? "Replay" : "Play";
   ui.step.disabled = stage.pos >= steps.length;
@@ -1013,8 +1337,11 @@ async function stageStep() {
   const step = steps[stage.pos];
   const animated = stage.speed > 0 && !reducedMotion();
   stage.busy = true;
+  stageShowTask(step.t);
   fill(stage.ui.caption, captionNodes(steps));
-  if (step.type === "doc") {
+  if (step.type === "task") {
+    if (animated) await sleep(900 / stage.speed);
+  } else if (step.type === "doc") {
     stage.viewer.select(step.i);
     if (animated) await sleep(450 / stage.speed);
   } else if (animated) {
@@ -1051,11 +1378,16 @@ function stageReset() {
 /* 6. Scoreboard                                                       */
 /* ------------------------------------------------------------------ */
 
-const score = { built: false, approver: "none", data: null, fuzz: null, busy: false, fuzzBusy: false };
+const score = { built: false, approver: "none", late: false, data: null, fuzz: null, busy: false, fuzzBusy: false, ticket: 0 };
 const APPROVERS = [
   ["none", "Nobody approves", "Holds are left waiting. This is what each guard does before any person is involved."],
-  ["careful", "Careful approver", "A person approves a hold only when the payment is genuine."],
+  ["careful", "Careful approver", "A person approves a hold only when the payment is genuine. No real person knows that for sure: this one is told."],
+  ["procedural", "Procedural approver", "A person who follows a written procedure. For a question about the account, they phone the vendor on a number they already had. For anything else, they check the amount against the invoice the user meant. They reject what fails."],
   ["careless", "Careless approver", "A person approves every hold without checking. Holds are only as good as the person reading them."],
+];
+const WHEN = [
+  [false, "At once", "The person answers each hold as soon as it appears."],
+  [true, "Late", "The person answers only after the agent's last request of each task, as a slower person would."],
 ];
 
 async function enterScore() {
@@ -1065,13 +1397,18 @@ async function enterScore() {
 }
 
 async function loadScore() {
+  /* Clicking quickly sends several requests; only the answer to the newest one is shown. */
+  const ticket = ++score.ticket;
   score.busy = true;
   renderScore();
   try {
-    score.data = await api("/api/benchmark?approver=" + encodeURIComponent(score.approver));
+    const data = await api("/api/benchmark?approver=" + encodeURIComponent(score.approver) + "&late=" + (score.late ? "1" : "0"));
+    if (ticket === score.ticket) score.data = data;
   } finally {
-    score.busy = false;
-    renderScore();
+    if (ticket === score.ticket) {
+      score.busy = false;
+      renderScore();
+    }
   }
 }
 
@@ -1105,7 +1442,10 @@ function tileEl(mode, s, maxLost) {
       el("dt", {}, "Attacks held / blocked"), el("dd", {}, s.attacks_held + " / " + s.attacks_blocked),
       el("dt", {}, "Ordinary tasks paid / held / blocked"),
       el("dd", {}, s.benign_paid + " / " + s.benign_held + " / " + s.benign_blocked + " of " + s.benign_total),
-      el("dt", {}, "Wanted payments inside attacks that still went through"), el("dd", {}, s.wanted_paid + " of " + s.wanted_total)),
+      el("dt", {}, "Wanted payments inside attacks: paid / waiting / refused"),
+      el("dd", {}, s.wanted_paid + " / " + (s.wanted_waiting || 0) + " / " + (s.wanted_refused || 0) + " of " + s.wanted_total),
+      s.benign_needed_person == null ? null : [el("dt", {}, "Ordinary tasks that needed a person"),
+        el("dd", {}, s.benign_needed_person + " of " + s.benign_total)]),
     lost ? null : el("p", { class: "note" }, "No unauthorised money moved in these scripted attacks."));
 }
 
@@ -1130,7 +1470,8 @@ function matrixEl(data, modes) {
   });
   const rowEl = (row) => el("tr", {},
     el("th", { scope: "row" }, el("span", { class: "mono" }, row.id), row.title,
-      row.known_gap ? [" ", el("span", { class: "tag tag-gap" }, "known gap")] : null),
+      row.tasks > 1 ? [" ", el("span", { class: "tag" }, row.tasks + " tasks")] : null,
+      row.known_gap ? [" ", el("span", { class: "tag tag-gap", title: row.miss_reason || "" }, "known gap")] : null),
     modes.map((m) => {
       const c = row.cells[m.id];
       if (!c) return el("td", {}, "");
@@ -1139,14 +1480,34 @@ function matrixEl(data, modes) {
       return el("td", {}, el("button", { type: "button", class: "cell " + cls,
         title: "Open " + row.id + " on the Stage", onclick: openCell(row, m.id) }, text, wanted ? el("small", {}, wanted) : null));
     }));
-  const group = (label, kind) => {
-    const rows = data.rows.filter((r) => r.kind === kind);
-    return rows.length ? [el("tr", { class: "group" }, el("th", { colspan: String(modes.length + 1) }, label)), rows.map(rowEl)] : [];
+  const span = String(modes.length + 1);
+  const group = (suite, label, kind) => {
+    const rows = data.rows.filter((r) => (r.suite || "standard") === suite && r.kind === kind);
+    return rows.length ? [el("tr", { class: "group" }, el("th", { colspan: span }, label)), rows.map(rowEl)] : [];
   };
+  /* One block per suite, in the order the server gives them: who wrote it, then its rows. */
+  const suites = (S.meta.suites || [{ id: "standard", note: "" }]).filter((x) => data.rows.some((r) => (r.suite || "standard") === x.id));
   return el("div", { class: "table-wrap" }, el("table", { class: "matrix" },
     el("thead", {}, el("tr", {}, el("th", { scope: "col" }, "Scenario"),
       modes.map((m) => el("th", { scope: "col" }, m.label, m.ours ? " (ours)" : "")))),
-    el("tbody", {}, group("Ordinary tasks", "benign"), group("Attacks", "attack"))));
+    suites.map((x) => el("tbody", { class: "suite" },
+      el("tr", { class: "suite-head" }, el("th", { colspan: span, scope: "rowgroup" }, suiteLabel(x.id) + " suite",
+        x.note ? el("span", { class: "suite-note" }, " \u00b7 " + x.note) : null)),
+      group(x.id, "Ordinary tasks", "benign"), group(x.id, "Attacks", "attack")))));
+}
+
+/** Per suite: attacks where unauthorised money moved, and ordinary tasks left waiting or refused. */
+function suitesEl(data, modes) {
+  const suites = (S.meta.suites || []).filter((x) => data.suites && data.suites[x.id]);
+  if (!suites.length) return null;
+  const cell = (sum) => el("td", {},
+    sum.attacks_total ? el("div", { class: sum.attacks_money_moved ? "error" : "" }, sum.attacks_money_moved + " of " + sum.attacks_total + " attacks moved money") : null,
+    sum.benign_total ? el("div", { class: "small muted" }, sum.benign_held + " held, " + sum.benign_blocked + " blocked of " + sum.benign_total + " ordinary") : null);
+  return el("div", { class: "table-wrap" }, el("table", { class: "matrix by-suite" },
+    el("thead", {}, el("tr", {}, el("th", { scope: "col" }, "Suite"), modes.map((m) => el("th", { scope: "col" }, m.label)))),
+    el("tbody", {}, suites.map((x) => el("tr", {},
+      el("th", { scope: "row" }, suiteLabel(x.id), el("div", { class: "small muted" }, x.note)),
+      modes.map((m) => cell(data.suites[x.id][m.id])))))));
 }
 
 function fuzzEl() {
@@ -1169,23 +1530,30 @@ function renderScore() {
   const data = score.data;
   const modes = S.meta.modes.filter((m) => !data || data.summary[m.id]);
   const approver = APPROVERS.find((a) => a[0] === score.approver);
+  const when = WHEN.find((w) => w[0] === score.late);
   const nodes = [
     el("h1", {}, "Scoreboard"),
-    el("p", { class: "view-lead" }, "Every scenario replayed under every guard. The two baselines are our own. Known gaps stay on the board."),
+    el("p", { class: "view-lead" }, "Every scenario of every suite replayed under every guard. The two baselines are our own. Known gaps stay on the board."),
     el("div", { class: "score-controls" },
       el("span", { class: "field-label" }, "Who decides holds:"),
       el("div", { class: "seg", role: "group", "aria-label": "Approver model" }, APPROVERS.map(([id, label]) =>
         segButton(label, score.approver === id, guard(() => { score.approver = id; return loadScore(); })))),
+      el("span", { class: "field-label" }, "When:"),
+      el("div", { class: "seg", role: "group", "aria-label": "When the person answers" }, WHEN.map(([late, label]) =>
+        segButton(label, score.late === late, guard(() => { score.late = late; return loadScore(); })))),
       el("button", { type: "button", class: "btn primary", disabled: score.busy, onclick: guard(loadScore) }, score.busy ? "Running…" : "Run again"),
-      data ? el("span", { class: "num", role: "status" }, plural(data.replays, "replay") + " in " + data.elapsed_ms + " ms on this machine, just now.") : null),
-    el("p", { class: "note" }, approver[2]),
+      data ? el("span", { class: "num", role: "status" }, "Shown: " + (APPROVERS.find((a) => a[0] === data.approver) || [0, data.approver])[1].toLowerCase() +
+        (data.approver === "none" ? "" : data.late ? ", answering late" : ", answering at once") + ". " +
+        plural(data.replays, "replay") + " in " + data.elapsed_ms + " ms on this machine, just now.") : null),
+    el("p", { class: "note" }, approver[2] + (score.approver === "none" ? "" : " " + when[2])),
   ];
   if (data) {
     const maxLost = Math.max(0, ...modes.map((m) => cents(data.summary[m.id].unauthorised)));
     nodes.push(
       el("div", { class: "tiles" }, modes.map((m) => tileEl(m, data.summary[m.id], maxLost))),
       el("p", { class: "note" }, "Bar: unauthorised money moved, relative to the largest guard. Solid = to attacker-controlled accounts, striped = to genuine vendor accounts."),
-      el("section", { class: "panel" }, el("h2", {}, "Every scenario, every guard (click a cell to replay it on the Stage)"), matrixEl(data, modes)),
+      el("section", { class: "panel" }, el("h2", {}, "By suite"), suitesEl(data, modes)),
+      el("section", { class: "panel" }, el("h2", {}, "Every scenario, every guard, by suite (click a cell to replay it on the Stage)"), matrixEl(data, modes)),
       el("section", { class: "panel" }, el("h2", {}, "Read this with the numbers"),
         el("ul", { class: "caveats" }, data.caveats.map((c) => el("li", {}, c)))));
   } else {
@@ -1229,7 +1597,8 @@ async function enterPlayground() {
     pg.docIndex = 0;
     renderPgForm();
   }) }, el("option", { value: "" }, "Start from…"),
-  S.meta.scenarios.map((s) => el("option", { value: s.id }, s.id + "  " + s.title)));
+  /* A playground scenario is one task, so only those can be a starting point. */
+  S.meta.scenarios.filter((s) => !(s.tasks > 1)).map((s) => el("option", { value: s.id }, s.id + "  " + s.title)));
   fill($("view-playground"),
     el("h1", {}, "Attack playground"),
     el("p", { class: "view-lead" }, "You are the attacker. Write the documents, script the hijacked agent, and try to move money to an account you control. ",
@@ -1457,21 +1826,38 @@ function chainVerdict(au) {
     detail: link ? "It points at a hash that is no longer there." : "Its content no longer matches its hash." };
 }
 
+/* Entries a person should notice in the log, with what they mean in plain words. */
+const NOTABLE = {
+  hold_confirmation_failed: "The account typed back did not match. Nothing was paid.",
+  task_quarantined: "The queue overflowed: this task pays nothing more without a person.",
+  vendor_account_removed: "Taken off the vendor file after a person rejected it.",
+};
+
 function auditDetail(e) {
   const d = e.data || {};
   const dec = d.decision || d;
   const req = d.request || d.canonical || {};
   const bits = [];
+  if (NOTABLE[e.event]) bits.push(NOTABLE[e.event]);
   if (e.event === "payment_decision" && dec.outcome) bits.push(dec.outcome + (dec.rule ? " (" + dec.rule + ")" : ""));
+  if (e.event === "payment_decision" && d.repeat === true) bits.push("asked again: joined the waiting hold");
+  if (e.event === "hold_confirmation_failed") bits.push("typed " + (typeof d.typed_account === "string" ? groups(d.typed_account) : "something that is not an IBAN"));
+  if (e.event === "task_quarantined" && typeof d.waiting === "number") bits.push(plural(d.waiting, "payment") + " waiting");
+  if (e.event === "vendor_account_removed" && typeof d.account === "string") bits.push(groups(d.account));
+  if (e.event === "hold_rejected" && d.account_refused === true) bits.push("account refused for the rest of the task");
+  if (e.event === "hold_rejected" && d.wrong === "payment") bits.push("only this payment was wrong");
   if (typeof d.transfer === "string") bits.push(d.transfer);
   if (typeof d.hold === "string") bits.push(d.hold);
   if (req.payee) bits.push(req.payee);
   if (req.amount) bits.push(money(req.amount));
-  if (e.event === "content_observed") bits.push(d.source || d.name || "");
+  if (e.event === "content_observed") bits.push(docNameText(d.source || d.name || ""));
   if (e.event === "task_started") {
     const m = d.mandate || d;
     if (Array.isArray(m.payees)) bits.push(m.payees.join(", "));
     if (m.max_total) bits.push("budget " + money(m.max_total));
+    if (typeof d.draft_digest === "string") bits.push("draft " + short(d.draft_digest));
+    const set = d.set_by_person && typeof d.set_by_person === "object" ? Object.keys(d.set_by_person) : [];
+    if (set.length) bits.push("set by the person for " + set.join(", "));
   }
   if (d.approver) bits.push("by " + d.approver);
   if (d.attestation) bits.push("attestation: " + d.attestation);
@@ -1484,7 +1870,7 @@ function auditDetail(e) {
 function chainEl(au) {
   return el("ol", { class: "chain", "aria-label": "Audit log entries" }, au.entries.map((e) => {
     const bad = !au.intact && e.seq === au.broken_at;
-    return el("li", { class: bad ? "bad" : "" },
+    return el("li", { class: bad ? "bad" : NOTABLE[e.event] ? "notable" : "" },
       el("span", { class: "seq" }, "#" + e.seq), el("span", { class: "ev" }, e.event),
       el("span", { class: "det" }, auditDetail(e)),
       el("span", { class: "hashes" }, "prev " + short(e.prev) + "  hash " + short(e.hash)),
@@ -1553,7 +1939,8 @@ function renderAudit() {
 /* ------------------------------------------------------------------ */
 
 const live = { built: false, state: null, seq: null, polling: false, lost: false, viewer: null, ui: {}, draft: null, draftTimer: 0,
-  form: { instruction: "", picked: {}, other: "", max_per_payment: "2000.00", max_total: "3000.00", hours: "8", max_payments: "" } };
+  /* adjust: payee -> { payments, amount } as the person typed them on the confirmation; empty = keep what was read */
+  form: { instruction: "", picked: {}, other: "", max_per_payment: "2000.00", max_total: "3000.00", hours: "8", max_payments: "", adjust: {} } };
 
 function liveHoldCtx() {
   const task = live.state && live.state.task;
@@ -1575,9 +1962,11 @@ function applyLive(state) {
   live.seq = state.head ? state.head.seq : null;
   const waiting = holdsOf(state.attempts).filter((a) => a.hold.status === "pending").length;
   document.title = (waiting ? "(" + waiting + ") " + (waiting === 1 ? "hold" : "holds") + " waiting · " : "") + "Countersign";
-  if (live.built) renderLive();
+  keepFocus(() => {
+    if (live.built) renderLive();
+    if (S.sheet && S.sheet.kind !== "limits" && S.view === "live") S.sheet.render();
+  });
   updateInboxCount();
-  if (S.sheet && S.sheet.kind !== "limits" && S.view === "live") S.sheet.render();
 }
 
 async function pollLive() {
@@ -1616,20 +2005,93 @@ function livePayees() {
   return [...Object.keys(f.picked).filter((name) => f.picked[name]), ...typed];
 }
 
+/** One line of what was read: the field, the words it came from (or "default"), and what it does. */
+function readingLine(r, withPayee) {
+  return el("li", {}, el("span", { class: "field-label" }, r.field + " "),
+    r.quote ? el("span", { class: "mono" }, "\u201c" + r.quote + "\u201d") : el("span", { class: "tag" }, "default"),
+    withPayee && r.payee ? " (" + r.payee + ")" : "", ": ", r.result);
+}
+
+/** What the person sets for one payee on top of what was read. Only what they type counts.
+    `note` is the drafter's line about a default count ({ text, several }), shown right by the box;
+    `from` the words a count was read from ({ quote, payments, instalments }), also by the box. */
+function adjustRow(payee, ask, note, from) {
+  const adj = live.form.adjust[payee] || (live.form.adjust[payee] = { payments: "", amount: "" });
+  const mark = el("span", { class: "tag tag-hold" }, "you set this");
+  const show = () => { mark.hidden = !(String(adj.payments).trim() || String(adj.amount).trim()); };
+  const count = el("input", { type: "text", inputmode: "numeric", size: "4", class: "num", "data-keep": "adjust:" + payee + ":payments",
+    placeholder: String(ask.payments || 1), "aria-label": "Payments to expect for " + payee,
+    oninput: (e) => { adj.payments = e.target.value; show(); } });
+  count.value = adj.payments;
+  const amount = el("input", { type: "text", inputmode: "decimal", size: "9", class: "num", "data-keep": "adjust:" + payee + ":amount",
+    placeholder: ask.amount ? money(ask.amount) : "not stated", "aria-label": "Most to pay " + payee + " in this task",
+    oninput: (e) => { adj.amount = e.target.value; show(); } });
+  amount.value = adj.amount;
+  show();
+  const countNote = note ? el("p", { class: note.several ? "count-note banner hold" : "count-note note", role: note.several ? "note" : null },
+    note.several ? el("strong", {}, "Warning: ") : null, note.text) : null;
+  return el("div", { class: "adjust" },
+    el("div", { class: "adjust-count" },
+      el("label", {}, "Expect ", count, " payment(s)"),
+      note ? el("span", { class: "tag" }, "1 is the default") : null,
+      from ? el("span", { class: "tag" }, from.payments + " read from \u201c" + from.quote + "\u201d" +
+        (from.instalments ? ", instalments of one invoice" : "")) : null),
+    countNote,
+    el("label", {}, "at most " + (S.meta ? S.meta.currency : "EUR") + " ", amount, " in total"),
+    mark,
+    el("span", { class: "note" }, "Leave empty to keep what was read. A value you type replaces it for " + payee + " only."));
+}
+
 function renderDraft() {
   const d = live.draft;
   const payees = livePayees();
   const box = live.ui.draft;
-  if (!d) return fill(box, el("span", { class: "muted" }, "As you type, this shows what Countersign found in your sentence."));
-  const bound = payees.length === 1 && d.accounts.length;
+  if (!d) return fill(box, el("span", { class: "muted" }, "As you type, this shows what Countersign read in your sentence. You confirm exactly what is shown here."));
+  // Everything the drafter read, per payee with the words it came from, everything it
+  // saw and did not use, the vendors named but not included and the accounts it does
+  // not trust: the same confirmation as `task start`. The digest goes back with the task.
+  const readings = d.readings || [];
+  const used = readings.filter((r) => r.used);
+  const unused = readings.filter((r) => !r.used);
+  const blocks = Object.keys(d.asks || {}).map((payee) => {
+    const note = (d.count_notes || {})[payee] || null;
+    const from = (d.count_from || {})[payee] || null;
+    const excl = (d.excludes || {})[payee] || null;
+    /* The default count's line is shown by the count box, and an exclusion as a banner: not twice. */
+    const mine = used.filter((r) => r.payee === payee && !(note && r.field === "payments" && !r.quote) &&
+      !(excl && r.field === "invoices" && r.quote === excl.quote && r.result === excl.text));
+    return el("div", { class: "payee-block" }, el("h4", {}, payee),
+      excl ? el("p", { class: "banner hold excluded", role: "note" }, el("strong", {}, "You said: "),
+        el("span", { class: "mono" }, "\u201c" + excl.quote + "\u201d"), ". ", excl.text) : null,
+      mine.length ? el("ul", { class: "readings" }, mine.map((r) => readingLine(r, false)))
+        : el("p", { class: "note" }, note || excl ? "Nothing else read for this payee." : "Nothing read for this payee."),
+      adjustRow(payee, d.asks[payee], note, from));
+  });
+  const other = used.filter((r) => !r.payee || !(r.payee in (d.asks || {})));
   return fill(box,
-    el("div", {}, el("span", { class: "field-label" }, "Known vendors in your sentence: "), d.payees.length ? d.payees.join(", ") : "none"),
-    el("div", {}, el("span", { class: "field-label" }, "Accounts in your sentence: "),
-      d.accounts.length ? el("span", { class: "mono" }, d.accounts.map(groups).join(", ")) : "none"),
-    d.amounts && d.amounts.length ? el("div", {}, el("span", { class: "field-label" }, "Amounts: "), d.amounts.map(money).join(", ")) : null,
-    d.accounts.length ? el("p", { class: bound ? "banner hold" : "note" }, bound
-      ? "An account typed here is trusted for that payee: " + payees[0] + ". Payments to it will not be held for being unverified."
-      : "An account typed here is trusted for a payee only when the task has exactly one payee. With " + payees.length + " payees it is bound to none of them.") : null);
+    el("div", { class: "draft-head" }, el("span", { class: "field-label" }, "What you confirm"),
+      el("span", { class: "mono muted", title: "sha256 of this reading of this sentence: " + d.digest }, "draft " + short(d.digest))),
+    d.mentioned && d.mentioned.length ? el("p", { class: "banner hold" }, "Named in your sentence but NOT a payee (tick one below only if you mean it): " + d.mentioned.join(", ")) : null,
+    payees.length ? null : el("p", { class: "note" }, "No payee yet: tick who may be paid below."),
+    blocks,
+    other.length ? el("ul", { class: "readings" }, other.map((r) => readingLine(r, true))) : null,
+    unused.length ? el("div", {}, el("span", { class: "field-label" }, "Seen in your sentence and not used:"),
+      el("ul", { class: "readings note" }, unused.map((r) => readingLine(r, true)))) : null,
+    d.unbound && d.unbound.length ? el("p", { class: "note" }, "Accounts in your sentence that are NOT trusted: ",
+      el("span", { class: "mono" }, d.unbound.map(groups).join(", ")), ". A payment to one of them will be held.") : null);
+}
+
+// Draft again for the payees that are ticked now. The first draft of a sentence
+// only suggests payees; what is read for each of them depends on who is ticked.
+async function refreshDraft() {
+  const f = live.form;
+  if (!f.instruction.trim()) { live.draft = null; return renderDraft(); }
+  const sent = f.instruction;
+  const payees = livePayees();
+  const d = await api("/api/live/draft", { instruction: sent, payees });
+  if (sent !== f.instruction || payees.join("\n") !== livePayees().join("\n")) return undefined;
+  live.draft = d;
+  return keepFocus(renderDraft);
 }
 
 function buildLiveForm() {
@@ -1647,13 +2109,12 @@ function buildLiveForm() {
       const d = await api("/api/live/draft", { instruction: sent });
       if (sent !== f.instruction) return undefined;
       for (const name of d.payees) if (!(name in f.picked)) f.picked[name] = true;
-      live.draft = d;
       renderLiveVendors();
-      return renderDraft();
+      return refreshDraft();
     }), 300);
   });
   const other = bound(f, "other", { placeholder: "Other payees, separated by commas" });
-  other.addEventListener("input", renderDraft);
+  other.addEventListener("input", guard(refreshDraft));
   fill(ui.form, el("div", { class: "live-grid" },
     el("section", { class: "panel" }, el("h2", {}, "Start a task"),
       field("What should the agent do?", instruction), ui.draft,
@@ -1663,7 +2124,7 @@ function buildLiveForm() {
         field("Per-payment limit", bound(f, "max_per_payment", { inputmode: "decimal", size: "9" })),
         field("Task budget", bound(f, "max_total", { inputmode: "decimal", size: "9" })),
         field("Valid for (hours)", bound(f, "hours", { inputmode: "numeric", size: "4" })),
-        field("Payment count (optional)", bound(f, "max_payments", { inputmode: "numeric", size: "5" }))),
+        field("Payments for the whole task (optional)", bound(f, "max_payments", { inputmode: "numeric", size: "5" }))),
       el("button", { type: "button", class: "btn primary", onclick: guard(startLiveTask) }, "Confirm the mandate and start the task")),
     el("section", { class: "panel" }, el("h2", {}, "Connect an agent"),
       el("p", {}, "Paste this MCP configuration into the agent. Its tools are: ", el("span", { class: "mono" }, S.meta.agent_tools.join(", ")),
@@ -1680,7 +2141,7 @@ function renderLiveVendors() {
   const f = live.form;
   const vendors = (live.state && live.state.vendors) || S.meta.vendors;
   fill(live.ui.vendors, vendors.map((v) => el("label", {},
-    el("input", { type: "checkbox", checked: !!f.picked[v.name], onchange: (e) => { f.picked[v.name] = e.target.checked; renderDraft(); } }),
+    el("input", { type: "checkbox", checked: !!f.picked[v.name], onchange: guard(async (e) => { f.picked[v.name] = e.target.checked; await refreshDraft(); }) }),
     " " + v.name + " ", el("span", { class: "mono muted" }, v.accounts.map(mask).join(", ")))));
 }
 
@@ -1691,23 +2152,52 @@ async function startLiveTask() {
   const count = String(f.max_payments).trim();
   if (count && !/^[1-9]\d*$/.test(count)) throw new Error("The payment count must be a whole number of 1 or more, or empty.");
   const payees = livePayees();
-  const accounts = payees.length === 1 && live.draft && live.draft.accounts.length ? { [payees[0]]: live.draft.accounts } : {};
+  if (!f.instruction.trim()) throw new Error("Type what the agent should do first.");
+  // The task confirms the draft that is on the screen. If reading the sentence for
+  // these payees now gives another draft, it is shown and nothing starts: the person
+  // confirms again. The server drafts once more and refuses a digest that differs.
+  const shown = live.draft;
+  const fresh = await api("/api/live/draft", { instruction: f.instruction, payees });
+  if (!shown || fresh.digest !== shown.digest) {
+    live.draft = fresh;
+    renderDraft();
+    throw new Error("What Countersign read changed since it was shown. Check it, then confirm again.");
+  }
+  const adjust = {};
+  for (const payee of payees) {
+    const a = f.adjust[payee];
+    if (!a) continue;
+    const n = String(a.payments).trim();
+    const m = String(a.amount).trim();
+    if (!n && !m) continue;
+    if (n && !/^[1-9]\d*$/.test(n)) throw new Error("The number of payments for " + payee + " must be a whole number of 1 or more.");
+    if (m && !MONEY.test(m)) throw new Error("The amount for " + payee + " must be a plain amount such as 650.00.");
+    adjust[payee] = { payments: n ? Number(n) : null, amount: m || null };
+  }
   const state = await api("/api/live/tasks", {
-    instruction: f.instruction.trim(), payees, max_per_payment: f.max_per_payment.trim(), max_total: f.max_total.trim(),
+    instruction: f.instruction, payees, max_per_payment: f.max_per_payment.trim(), max_total: f.max_total.trim(),
     hours, max_payments: count ? Number(count) : null,
-    references: [], accounts,
+    references: [], accounts: {}, draft_digest: shown.digest, adjust,
   });
+  f.adjust = {};
   S.lastApproval = null;
   applyLive(state);
 }
 
 function attemptRow(a, ctxFor) {
   const st = pillStatus(a);
+  const badge = st.cls === "paid" ? "allow" : st.cls === "held" || st.cls === "joined" ? "hold" : "block";
+  /* The rule's title for a refusal ("Already paid in this task"); a repeat says which hold it joined. */
+  const why = a.repeat ? "Asked again while " + a.hold.id + " waited: it joined that hold" +
+      (a.hold.status === "pending" ? ", which still waits" : ", which is now " + a.hold.status)
+    : a.status === "blocked" && a.rule_title ? a.rule_title : "";
   return el("button", { type: "button", class: "attempt-row", onclick: (ev) => openLiveEvidence(a.index, ev.currentTarget, ctxFor) },
     el("span", { class: "mono" }, "#" + (a.index + 1)),
     el("span", {}, el("strong", {}, a.payee), "  ", el("span", { class: "num" }, eur(a.amount))),
-    el("span", { class: "badge " + (st.cls === "paid" ? "allow" : st.cls === "held" ? "hold" : "block") }, st.label),
-    el("span", { class: "sub" }, el("span", { class: "mono" }, groups(a.account)), "  reference " + a.reference));
+    el("span", { class: "badge " + badge },
+      !a.repeat && a.status === "held" && a.rules && a.rules.length ? "HELD " + a.rules.join(" ") : st.label),
+    el("span", { class: "sub" }, el("span", { class: "mono" }, groups(a.account)), "  reference " + a.reference,
+      why ? el("span", { class: "why" }, why) : null));
 }
 
 function openLiveEvidence(index, opener) {
@@ -1730,6 +2220,7 @@ function renderLive() {
     el("span", {}, "Guard: ", el("b", {}, st.guard_mode)),
     el("span", {}, "Audit head: ", el("span", { class: "mono" }, "#" + st.head.seq + " " + short(st.head.hash))),
     el("span", { class: au.intact ? "" : "error" }, au.intact ? "chain verifies" : "TAMPERING DETECTED at entry " + au.broken_at),
+    task && task.quarantine ? el("span", { class: "tag tag-block", title: task.quarantine.text }, "task quarantined") : null,
     el("span", {}, "Simulated balance: ", el("b", { class: "num" }, eur(st.balance))),
     live.lost ? el("span", { class: "error" }, "Connection lost. Retrying every second.") : el("span", { class: "muted" }, "Checked every second."),
     active ? el("button", { type: "button", class: "btn strong", onclick: guard(async () => applyLive(await api("/api/live/tasks/end", {}))) }, "End task") : null);
@@ -1740,14 +2231,14 @@ function renderLive() {
   }
   if (!task) return fill(ui.session);
   const m = task.mandate;
-  const source = { attempts: st.attempts, ctx: liveHoldCtx(), where: "live session" };
+  const source = { attempts: st.attempts, ctx: liveHoldCtx(), where: "live session", quarantines: [] };
   const pending = holdsOf(st.attempts).filter((a) => a.hold.status === "pending");
   live.viewer.set(st.documents, m.payees);
-  return fill(ui.session, el("div", { class: "live-grid" },
+  return fill(ui.session, task.quarantine ? quarantineBanner(task.quarantine) : null, el("div", { class: "live-grid" },
     el("div", { class: "live-col" },
       el("section", { class: "panel" }, el("h2", {}, "The mandate you confirmed (trusted)"),
         el("p", { class: "quote" }, "“" + m.instruction + "”"),
-        el("div", { class: "chips" }, mandateChips({ live: { mandate: m } })),
+        el("div", { class: "chips" }, mandateChips(m)),
         el("p", { class: "note" }, "Paid so far: " + eur(task.spent) + " in " + plural(task.payments, "payment") + ".")),
       el("section", { class: "panel docs" }, el("h2", {}, "What the agent has read (untrusted)"), live.viewer.root)),
     el("div", { class: "live-col" },
@@ -1761,7 +2252,9 @@ function renderLive() {
           el("tbody", {}, st.transfers.map((t) => el("tr", {}, el("td", { class: "mono" }, t.id), el("td", {}, t.payee),
             el("td", { class: "mono" }, mask(t.account)), el("td", { class: "num" }, money(t.amount)), el("td", {}, t.reference))))))
           : el("p", { class: "empty" }, "No transfers.")),
-      el("section", { class: "panel" }, el("h2", {}, "Audit log (" + plural(au.entries.length, "entry", "entries") + ")"), chainEl(au)))));
+      el("section", { class: "panel" }, el("h2", {}, "Activity log: the audit log (" + plural(au.entries.length, "entry", "entries") + ")"),
+        el("p", { class: "note" }, "Highlighted: an account typed back that did not match, a task that stopped paying without a person, an account taken off the vendor file."),
+        chainEl(au)))));
 }
 
 /* ------------------------------------------------------------------ */

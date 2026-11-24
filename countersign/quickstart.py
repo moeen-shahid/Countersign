@@ -22,9 +22,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import mcp
-from .console import confirm, default_name, describe_mandate, is_terminal, show
+from .agent import one_task_ids, several_tasks
+from .console import confirm, default_name, describe_confirmation, is_terminal, show
+from .drafting import draft_mandate
 from .scenarios import BY_ID
-from .simulation import default_vendors, scenario_mandate
+from .simulation import scenario_mandate, scenario_vendors
 from .store import Store, StoreError
 
 DEFAULT_DIR = "countersign-demo"
@@ -87,7 +89,10 @@ def _command(args: argparse.Namespace) -> int:
     scenario = BY_ID.get(args.scenario)
     if scenario is None:
         return _fail(f"there is no scenario {show(args.scenario, 40)}. "
-                     f"Scenarios: {', '.join(sorted(BY_ID))}.")
+                     f"Scenarios: {', '.join(sorted(one_task_ids()))}.")
+    refused = several_tasks(scenario)
+    if refused is not None:
+        return _fail(refused)
     if not args.yes and not is_terminal():
         return _fail("signing the demo mandate needs a person at a terminal (or pass --yes).")
     root = os.path.abspath(args.dir)
@@ -100,7 +105,9 @@ def _command(args: argparse.Namespace) -> int:
     try:
         os.makedirs(inbox, exist_ok=True)
         names = _write_inbox(inbox, scenario.documents)
-        store = Store.create(db, vendors=default_vendors(), receipts=receipts, inbox=inbox)
+        # The scenario's own vendor file: the demo vendors, plus any supplier it adds.
+        store = Store.create(db, vendors=scenario_vendors(scenario), receipts=receipts,
+                             inbox=inbox)
     except (OSError, ValueError, StoreError) as exc:
         return _fail(f"could not set up {root}: {exc}")
 
@@ -117,14 +124,20 @@ def _command(args: argparse.Namespace) -> int:
 
     now = datetime.now(timezone.utc)
     mandate = scenario_mandate(scenario, lambda: now)
+    # The same confirmation `task start` shows: the mandate, and every reading of
+    # the sentence with the words it came from. scenario_mandate drafts it the same way.
+    vendors = scenario_vendors(scenario)
+    draft = draft_mandate(scenario.instruction, vendors, scenario.payees)
     print("Mandate to sign (what this scenario's user asks for)")
-    print("\n".join(describe_mandate(mandate, default_vendors(), now)))
+    print("\n".join(describe_confirmation(mandate, draft, vendors, now, hint=False)))
     if not args.yes and not confirm("Sign this mandate? [y/N] "):
         print("Nothing was signed. The database and the inbox are ready; start a task "
               f"yourself with: python -m countersign task start \"...\" --payee NAME --db {db}")
         return 1
     try:
-        store.console().start_task(mandate, confirmed_by=default_name())
+        # The digest says which reading of the sentence was confirmed (task_started).
+        store.console().start_task(mandate, confirmed_by=default_name(),
+                                   draft_digest=draft.digest())
     except (ValueError, StoreError) as exc:
         return _fail(f"the task was not started: {exc}", 1)
     print(f"Task started: {mandate.id}.")
@@ -155,6 +168,9 @@ def _command(args: argparse.Namespace) -> int:
     if args.no_serve:
         print("Decide held payments with: python -m countersign holds list --db "
               f"{shlex.quote(db)}")
+        print("Approving a payment whose account is in question asks you to type back the "
+              "whole account, as the vendor confirmed it to you on a number you already had. "
+              "Rejecting one asks what was wrong: the account, or only this payment.")
         return 0
     return _serve(args.port, db)
 

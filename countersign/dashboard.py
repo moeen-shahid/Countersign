@@ -54,12 +54,37 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__, scenarios
 from .audit import entry_hash, export_jsonl, verify_entries
-from .guard import DECLINED, UNCONFIRMED
+from .console import (
+    MAX_SET_PAYMENTS,
+    REJECT_CHOICES,
+    adjust_asks,
+    count_reading,
+    default_count_note,
+    exclusion_reading,
+    held_rules,
+    hold_facts,
+    quarantine_of,
+    quarantine_text,
+    reject_choices,
+    reject_consequence,
+    rule_facts,
+    usual_amount_change,
+)
+from .drafting import describe_draft, draft_mandate
+from .guard import DECLINED, NOT_RESHOWN, UNCONFIRMED, Guard, Hold
 from .iban import canonical_iban, find_ibans
-from .models import Decision, Mandate, Outcome, clean_label, parse_amount, plain
-from .policy import RULE_GUARDS, RULE_ORDER, RULE_OUTCOMES, RULES, rule_title
+from .models import (
+    Ask,
+    Decision,
+    Mandate,
+    Outcome,
+    clean_label,
+    parse_amount,
+    plain,
+)
+from .policy import RULE_GUARDS, RULE_ORDER, RULE_OUTCOMES, RULES, rule_title, usual_ceiling
 from .provenance import UNNAMED, USER_SOURCE
-from .simulation import MODE_LABELS, MODES, Run, default_vendors, run_scenario
+from .simulation import APPROVERS, MODE_LABELS, MODES, Run, default_vendors, run_scenario
 from .vendors import VendorFile
 
 DEFAULT_PORT = 8377
@@ -70,7 +95,6 @@ TOKEN_ENV = "COUNTERSIGN_TOKEN"
 APPROVER = "console"  # how the audit log names a decision made on this page
 MAX_FUZZ_RUNS = 2000
 MAX_TASK_HOURS = 24 * 31
-APPROVERS = ("none", "careful", "careless")
 TAMPER_STAGES = ("edit", "rehash", "rechain", "truncate")
 EDITED = "(edited after the fact)"
 
@@ -109,13 +133,33 @@ LIMITS = (
     "of the mandate cannot be told from a genuine one, and is paid.",
     "A person who approves a hold without checking loses that payment. Holds only work if "
     "someone reads them.",
-    "An account typed in the instruction is trusted for the payee when the task has exactly "
-    "one payee and the vendor file has no account for that payee. Whoever can type the "
-    "instruction is the user.",
+    "To approve a payment whose account is in question, the person types back the whole "
+    "account the vendor confirmed. That stops a look-alike account and a hurried click. It "
+    "does not stop a person who copies the account from the hold or the invoice instead of "
+    "asking the vendor on a number they already had.",
+    "Marking an approved amount as a payee's new usual amount raises the line for later "
+    "tasks. A wrong mark lets the agent pay up to the new line without asking.",
+    "An account typed in the instruction is trusted for a payee only in a task with exactly "
+    "one payee, when the sentence gives it as the place to pay that payee (\"to IBAN ...\" in "
+    "the clause that tells the agent to pay), carries no negation, warning, question or "
+    "condition, and the vendor file has no account for that payee. The words that count as "
+    "a warning are a fixed list; a warning in other words, in that same clause, is not "
+    "recognised. A user who was fooled into typing the wrong account is trusted. Whoever "
+    "can type the instruction is the user.",
+    "The amount, the number of payments (one per payee unless the sentence counts more) and "
+    "the invoice numbers are read from the instruction by fixed rules, in English, and a "
+    "reading can be wrong: the person who confirms the task is shown every line. A payment "
+    "above the amount or beyond the count is held; one for an invoice that was not named is "
+    "refused. A count of two or more, or an amount stated for a payee with no usual amount, "
+    "lets through payments that would otherwise wait, up to the user's own number. No "
+    "reading lifts the unusual-amount or duplicate holds.",
+    "When the sentence does not name the invoice, one payment inside every limit can go to "
+    "the genuine account for an invoice that does not exist, and the genuine invoice is then "
+    "held as one payment too many.",
     "Origin tracking sees only what the agent reads through the guard. An account the agent "
     "learned any other way counts as seen nowhere, and the payment is refused.",
-    "A payee with no payment history on file has no usual amount, so the unusual-amount rule "
-    "does not apply to it.",
+    "A payee with no usual amount on file is held unless the user states an amount. A "
+    "stated amount that is wrong is paid up to that amount.",
     "The audit log is tamper-evident, not tamper-proof. Cutting off its end, or rewriting all "
     "of it, is caught only against a head or receipt kept somewhere this machine cannot "
     "rewrite.",
@@ -194,7 +238,7 @@ def document_view(
     """
     at = _utf16(text)
     accounts = []
-    for match in find_ibans(text):
+    for match in find_ibans(text, rendered=True):  # as the guard reads a document
         owner = vendors.owner_of(match.account)
         accounts.append(
             {
@@ -203,6 +247,7 @@ def document_view(
                 "end": at(match.end),
                 "on_file_for": owner.name if owner is not None else None,
                 "attacker": None if attackers is None else match.account in attackers,
+                "rendered": match.rendered,
             }
         )
     return {
@@ -225,9 +270,15 @@ def _attackers(scenario: Any) -> frozenset[str] | None:
     return None if scenario.id == "custom" and not own else own
 
 
+def _tasks(scenario: Any) -> tuple[Any, ...]:
+    """Every task of a scenario, in order. One for a scenario of one task."""
+    return tuple(scenario.tasks())
+
+
 def _has_hidden_text(scenario: Any) -> bool:
     return any(
-        hidden for text in scenario.documents.values() for _, _, hidden in _segments(text)
+        hidden for task in _tasks(scenario) for text in task.documents.values()
+        for _, _, hidden in _segments(text)
     )
 
 
@@ -239,17 +290,39 @@ def scenario_summary(scenario: Any) -> dict[str, Any]:
         "family": scenario.family,
         "summary": scenario.summary,
         "known_gap": bool(scenario.known_miss),
+        "suite": getattr(scenario, "suite", "standard"),
+        "tasks": len(_tasks(scenario)),
     }
 
 
 def scenario_view(scenario: Any, vendors: VendorFile) -> dict[str, Any]:
+    """A scenario as the Stage shows it. `instruction` and `documents` are the
+    first task's; `tasks` lists every task with its own sentence, payees,
+    limits and documents (a scenario of several tasks runs them one after
+    another on one guard)."""
     attackers = _attackers(scenario)
     view = scenario_summary(scenario)
-    view["instruction"] = scenario.instruction
-    view["documents"] = [
-        document_view(name, text, vendors, attackers)
-        for name, text in scenario.documents.items()
-    ]
+    tasks = []
+    for number, task in enumerate(_tasks(scenario), 1):
+        own_limit = getattr(task, "max_per_payment", None)
+        own_total = getattr(task, "max_total", None)
+        tasks.append({
+            "number": number,
+            "instruction": task.instruction,
+            "payees": list(task.payees or scenario.payees),
+            # The limits the person chose for this task: its own, or the scenario's.
+            "max_per_payment": plain(own_limit if own_limit is not None
+                                     else scenario.max_per_payment),
+            "max_total": plain(own_total if own_total is not None else scenario.max_total),
+            "gap_hours": int(task.gap_hours),
+            "attempts": len(task.attempts),
+            "documents": [document_view(name, text, vendors, attackers)
+                          for name, text in task.documents.items()],
+        })
+    view["instruction"] = tasks[0]["instruction"]
+    view["documents"] = tasks[0]["documents"]
+    view["tasks"] = tasks
+    view["miss_reason"] = getattr(scenario, "miss_reason", "")
     return view
 
 
@@ -283,15 +356,105 @@ def _evidence(decision: Mapping[str, Any], texts: Mapping[str, str]) -> dict[str
     return evidence
 
 
-def _hold_info(hold: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def rejections(entries: Iterable[Any]) -> dict[str, dict[str, Any]]:
+    """Per rejected hold, what the rejection did beyond refusing the payment:
+    `account_refused` (the person said the account was wrong, so it is
+    refused for the rest of the task), `vendor_removed` (it came off the
+    vendor file) and `wrong`, what the person said was wrong ("account",
+    "payment", or None for a rejection logged before v0.3). Read from the
+    audit log (`hold_rejected`, `vendor_account_removed`)."""
+    found: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        data = _data(entry)
+        hold = data.get("hold")
+        if not isinstance(hold, str):
+            continue
+        if _event(entry) == "hold_rejected":
+            found.setdefault(hold, {"account_refused": False, "vendor_removed": False,
+                                    "wrong": None})
+            found[hold]["account_refused"] = data.get("account_refused") is True
+            found[hold]["wrong"] = data.get("wrong") if data.get("wrong") in REJECT_CHOICES \
+                else None
+        elif _event(entry) == "vendor_account_removed":
+            found.setdefault(hold, {"account_refused": True, "vendor_removed": False,
+                                    "wrong": None})
+            found[hold]["vendor_removed"] = True
+    return found
+
+
+def _hold_info(
+    hold: Mapping[str, Any] | None, rejected: Mapping[str, Mapping[str, Any]] | None = None
+) -> dict[str, Any] | None:
     if hold is None:
         return None
+    done = (rejected or {}).get(hold["id"]) or {}
     return {
         "id": hold["id"],
         "digest": hold["digest"],
         "status": hold["status"],
         "decided_by": hold.get("decided_by"),
         "attestation": hold.get("attestation"),
+        "account_refused": bool(done.get("account_refused")),
+        "vendor_removed": bool(done.get("vendor_removed")),
+        "wrong": done.get("wrong"),
+    }
+
+
+def approval_view(
+    hold: Hold, vendors: VendorFile, related: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """What a person is asked for before approving a hold that waits.
+
+    `typed_account`: the hold is about the account (P1, P2, P3), so the whole
+    account has to be typed back as the vendor confirmed it; the page never
+    fills it in. `remember_account`: the account is not on file (P1, P2).
+    `usual_amount`: the hold is about the amount (A1, A2): the A1 line for
+    one invoice now and after the mark, from the vendor file as it is now,
+    and what the mark changes in words.
+
+    `related` is what the guard says about this hold now (`Guard.related`,
+    `Store.related`), not when it was made: `rivals`, waiting holds of the
+    same invoice to another account (D3); `waiting`, the waiting holds that,
+    if paid, would make this one break a limit (H2), and `projected_rules`
+    which limits; `cleared`, a D3 or H2 shown with the hold that no longer
+    applies; `refused`, the rule that would refuse it now (approving it would
+    pay nothing), and then nothing is "cleared". `on_reject` says what
+    rejecting does. `reject_choices` lists, for a hold about the account,
+    the two answers the person must choose between when rejecting it
+    ({wrong, label, text}; none is chosen for them); empty for any other
+    hold, which is rejected as it is.
+    """
+    from .store import needs_typed_account, offers_remember_account, offers_usual_amount
+
+    request = hold.request
+    usual = None
+    if offers_usual_amount(hold) and request.amount is not None:
+        history = vendors.history_for(request.payee)
+        now = usual_ceiling(history)
+        usual = {
+            "amount": plain(request.amount),
+            "now": None if now is None else plain(now),
+            "after": plain(usual_ceiling(history + (request.amount,))),
+            "text": usual_amount_change(request.payee, request.amount, history),
+        }
+    related = related or {}
+    rules_now = set(related.get("rules") or ())
+    refused = [{"rule": str(r), "title": rule_title(str(r))}
+               for r in related.get("refused") or ()]
+    return {
+        "typed_account": needs_typed_account(hold),
+        "remember_account": offers_remember_account(hold),
+        "usual_amount": usual,
+        "rivals": [str(h) for h in related.get("rivals") or ()],
+        "waiting": [str(h) for h in related.get("waiting") or ()],
+        "projected_rules": [{"rule": str(r), "title": rule_title(str(r))}
+                            for r in related.get("projected_rules") or ()],
+        "cleared": [r for r in hold.decision.rules if r in NOT_RESHOWN and r not in rules_now]
+        if related and not refused else [],
+        "refused": refused,
+        "on_reject": reject_consequence(hold, vendors),
+        "reject_choices": [{"wrong": wrong, "label": label, "text": text}
+                           for wrong, label, text in reject_choices(hold, vendors)],
     }
 
 
@@ -311,10 +474,38 @@ def attempt_view(
     legit: bool | None = None,
     to_attacker: bool | None = None,
     note: str = "",
+    approval: dict[str, Any] | None = None,
+    rejected: Mapping[str, Mapping[str, Any]] | None = None,
+    task: int = 1,
+    repeat: bool = False,
+    transfers: Iterable[Any] = (),
 ) -> dict[str, Any]:
-    """One payment the agent asked for, with the guard's answer and what became of it."""
+    """One payment the agent asked for, with the guard's answer and what became of it.
+
+    `held` lists every rule the decision carries with what it found (the
+    rule's line of the ladder), `facts` the trusted facts the rules used
+    (`console.hold_facts`), `found` what else the guard found for the rules
+    of v0.3 (`console.rule_facts`: hidden figures, a look-alike reference,
+    another invoice with the number you named, invoices your sentence left
+    out, an amount above every usual one) from this task's documents
+    (`texts`) and the bank's `transfers`, and `approval` what a person is
+    asked for to approve a hold that waits (`approval_view`); None otherwise. `task` is
+    the task it was asked in (from 1); `repeat` is true when it asked again
+    for a payment that was waiting and joined that hold. `rejected`
+    (`rejections`) says what a rejection of its hold did.
+    """
     rule = str(decision.get("rule") or "")
     return {
+        "task": task,
+        "repeat": repeat,
+        "held": [{"rule": code, "title": title, "detail": detail}
+                 for code, title, detail in held_rules(decision)]
+        if decision.get("outcome") in ("HOLD", "BLOCK") else [],
+        "facts": hold_facts(decision),
+        "found": rule_facts(decision, reference=reference, amount=amount,
+                            texts={k: v for k, v in texts.items() if k != USER_SOURCE},
+                            transfers=transfers),
+        "approval": approval,
         "index": index,
         "payee": payee,
         "account": account,
@@ -331,7 +522,7 @@ def attempt_view(
         "reason": decision.get("reason"),
         "checks": _checks(decision),
         "evidence": _evidence(decision, texts),
-        "hold": _hold_info(hold),
+        "hold": _hold_info(hold, rejected),
         "transfer_id": transfer_id,
         "status": status,
     }
@@ -376,10 +567,13 @@ def _amount_text(value: object) -> str:
     return plain(parsed) if parsed is not None else str(value)
 
 
-def _lab_texts(scenario: Any) -> dict[str, str]:
-    """The texts of a replay under the names the guard uses for them in evidence."""
-    texts = {USER_SOURCE: scenario.instruction}
-    for name, text in scenario.documents.items():
+def _lab_texts(scenario: Any, task: Any = None) -> dict[str, str]:
+    """The texts of one task of a replay under the names the guard uses for
+    them in evidence. Each task has its own: what the agent read is tracked
+    per task."""
+    task = task if task is not None else _tasks(scenario)[0]
+    texts = {USER_SOURCE: task.instruction}
+    for name, text in task.documents.items():
         texts.setdefault(clean_label(name) or UNNAMED, text)
     return texts
 
@@ -388,23 +582,48 @@ REPEATED = (
     "The bank had already sent exactly this payment in this task ({transfer}), so it sent "
     "nothing new for this request."
 )
+JOINED = (
+    "The agent asked again for exactly this payment while hold {hold} was waiting. It joined "
+    "that hold: one decision covers both requests, and the payment is made at most once."
+)
+
+
+def quarantine_view(entries: Iterable[Any], task_id: object) -> dict[str, Any] | None:
+    """The quarantine banner of one task, or None if the task was not quarantined:
+    the queue of payments waiting for a person overflowed, so the task stopped
+    paying anything without a person, and how many requests that refused."""
+    found = quarantine_of(entries, task_id)
+    if found is None:
+        return None
+    return {"task": task_id, "waiting": found["waiting"], "refused": found["refused"],
+            "text": quarantine_text(found["refused"])}
 
 
 def run_state(run: Run, refusals: Mapping[str, Decision] | None = None) -> dict[str, Any]:
     """One scenario replayed under one guard, as the contract's RunState.
 
-    `refusals` holds, per hold id, the guard's answer to an approval that it
-    refused. The totals are the replay's own (`Run.unauthorised_paid`,
-    `Run.to_attacker_paid`), the same numbers the benchmark reports.
+    Every task of the scenario, in order: each attempt says which task it
+    belongs to (`task`, from 1), and `mandates` holds each task's mandate
+    (`mandate` is the first one). `refusals` holds, per hold id, the guard's
+    answer to an approval that it refused. The totals are the replay's own
+    (`Run.unauthorised_paid`, `Run.to_attacker_paid`), the same numbers the
+    benchmark reports. `quarantines` lists the tasks whose queue overflowed.
     """
     scenario, guard = run.scenario, run.guard
     attackers = _attackers(scenario)
-    texts = _lab_texts(scenario)
+    tasks = _tasks(scenario)
+    texts = [_lab_texts(scenario, task) for task in tasks]
     refusals = refusals or {}
+    entries = guard.audit.entries if guard is not None else []
+    rejected = rejections(entries)
     attempts = []
     sent: dict[str, str | None] = {}  # transfer id -> the hold it was paid through
+    seen_holds: set[str] = set()
+    related: dict[str, dict[str, Any]] = {}
+    paid = [transfer.to_dict() for transfer in run.bank.transfers]
 
-    for index, (attempt, result) in enumerate(zip(scenario.attempts, run.results)):
+    for index, (attempt, result) in enumerate(zip(run.attempts, run.results)):
+        number = run.task_of[index] if index < len(run.task_of) else 1
         request = result.request
         account = canonical_iban(attempt.account) or str(attempt.account)
         hold = None
@@ -417,7 +636,18 @@ def run_state(run: Run, refusals: Mapping[str, Decision] | None = None) -> dict[
         decision = _shown_decision(
             result.decision.to_dict(), hold, None if refusal is None else refusal.to_dict()
         )
+        approval = None
+        if hold is not None and hold["status"] == "pending":
+            if result.hold_id not in related:
+                related[result.hold_id] = guard.related(result.hold_id)
+            approval = approval_view(guard.hold(result.hold_id), guard.vendors,
+                                     related[result.hold_id])
         note = attempt.note
+        repeat = result.hold_id is not None and result.hold_id in seen_holds
+        if repeat:
+            note = (note + " " if note else "") + JOINED.format(hold=result.hold_id)
+        if result.hold_id is not None:
+            seen_holds.add(result.hold_id)
         if transfer_id is not None:
             if transfer_id in sent and sent[transfer_id] != result.hold_id:
                 # The same request twice: the bank answers the second with the
@@ -425,36 +655,48 @@ def run_state(run: Run, refusals: Mapping[str, Decision] | None = None) -> dict[
                 note = (note + " " if note else "") + REPEATED.format(transfer=transfer_id)
             sent.setdefault(transfer_id, result.hold_id)
         amount = request.amount if request is not None and request.amount is not None else None
-        attempts.append(
-            attempt_view(
-                index,
-                payee=request.payee if request is not None else str(attempt.payee),
-                account=account,
-                account_raw=str(attempt.account),
-                amount=plain(amount) if amount is not None else _amount_text(attempt.amount),
-                reference=str(attempt.reference),
-                decision=decision,
-                texts=texts,
-                hold=hold,
-                transfer_id=transfer_id,
-                status=run.status(index),
-                legit=bool(attempt.legit),
-                to_attacker=None if attackers is None else account in attackers,
-                note=note,
-            )
+        view = attempt_view(
+            index,
+            payee=request.payee if request is not None else str(attempt.payee),
+            account=account,
+            account_raw=str(attempt.account),
+            amount=plain(amount) if amount is not None else _amount_text(attempt.amount),
+            reference=str(attempt.reference),
+            decision=decision,
+            texts=texts[number - 1] if 0 < number <= len(texts) else texts[0],
+            hold=hold,
+            transfer_id=transfer_id,
+            status=run.status(index),
+            legit=bool(attempt.legit),
+            to_attacker=None if attackers is None else account in attackers,
+            note=note,
+            approval=approval,
+            rejected=rejected,
+            task=number,
+            repeat=repeat,
+            transfers=paid,
         )
+        attempts.append(view)
 
     wanted = {transfer.id: bool(attempt.legit) for attempt, transfer in run.payments()}
     audit = None
     if guard is not None:
         # A copy: the answer must not change when the log does.
-        entries = copy.deepcopy(guard.audit.entries)
-        intact, broken_at = verify_entries(entries)
-        audit = audit_view(entries, intact, broken_at)
+        copied = copy.deepcopy(guard.audit.entries)
+        intact, broken_at = verify_entries(copied)
+        audit = audit_view(copied, intact, broken_at)
+    mandates = list(run.mandates) if guard is not None else []
+    quarantines = []
+    for number, mandate in enumerate(mandates, 1):
+        found = quarantine_view(entries, mandate.id)
+        if found is not None:
+            quarantines.append({**found, "number": number})
     return {
         "mode": run.mode,
         "mode_label": MODE_LABELS[run.mode],
         "mandate": None if guard is None else run.mandate.to_dict(),
+        "mandates": [mandate.to_dict() for mandate in mandates],
+        "quarantines": quarantines,
         "attempts": attempts,
         "unauthorised": plain(run.unauthorised_paid()),
         "to_attacker": plain(run.to_attacker_paid()),
@@ -489,10 +731,14 @@ def build_meta(live: bool) -> dict[str, Any]:
              "guards": list(RULE_GUARDS[rule])}
             for rule in RULE_ORDER
         ],
+        # Every suite, in order: the Stage and the scoreboard show all of them.
         "scenarios": [
             {**scenario_summary(scenario), "hidden_text": _has_hidden_text(scenario)}
-            for scenario in scenarios.SCENARIOS
+            for scenario in scenarios.ALL_SCENARIOS
         ],
+        "suites": [{"id": suite, "note": scenarios.SUITE_NOTES.get(suite, "")}
+                   for suite in scenarios.SUITES],
+        "approvers": list(APPROVERS),
         "vendors": default_vendors().to_state(),
         "attacker_accounts": sorted(scenarios.ATTACKER_ACCOUNTS),
         "agent_tools": agent_tools(),
@@ -544,7 +790,38 @@ def _live_task(snapshot: Mapping[str, Any], started: Any) -> dict[str, Any] | No
         "expired": bool(active and expires is not None and now >= expires),
         "spent": spent,
         "payments": payments,
+        # The queue overflowed in this task, so it pays nothing more without a person.
+        "quarantine": quarantine_view(snapshot["entries"], mandate.get("id")),
     }
+
+
+def _shown_related(hold: Hold) -> dict[str, Any]:
+    """What the hold showed when it was made, for when the guard cannot be asked."""
+    evidence = hold.decision.evidence
+    return {
+        "rules": list(hold.decision.rules),
+        "rivals": list(getattr(evidence, "rivals", ()) or ()),
+        "waiting": list(getattr(evidence, "waiting_holds", ()) or ())
+        if "H2" in hold.decision.rules else [],
+        "projected_rules": list(getattr(evidence, "projected_rules", ()) or ())
+        if "H2" in hold.decision.rules else [],
+    }
+
+
+def live_related(snapshot: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """`Store.related` for every waiting hold, at the moment of the snapshot:
+    one guard is rebuilt from the snapshot's state and asked about each."""
+    state = snapshot["state"]
+    pending = [hold["id"] for hold in state.get("holds") or () if hold.get("status") == "pending"]
+    if not pending:
+        return {}
+    now = _parse_time(snapshot.get("now")) or datetime.now(timezone.utc)
+    try:
+        guard = Guard.from_state(copy.deepcopy(state), clock=lambda: now)
+        return {hold_id: guard.related(hold_id) for hold_id in pending}
+    except (ValueError, KeyError, TypeError):
+        # A state this guard cannot rebuild: show what each hold showed when made.
+        return {}
 
 
 def _live_attempts(
@@ -553,10 +830,14 @@ def _live_attempts(
     """Every payment the agent asked for since the task began, oldest first.
 
     Read from the `payment_decision` entries of the audit log. What became of
-    a hold, and its transfer, come from the guard's state.
+    a hold, and its transfer, come from the guard's state; the rivals and
+    waiting payments of a hold that waits from the guard, now (`live_related`).
     """
     entries = [entry for entry in snapshot["entries"] if isinstance(entry, dict)]
     holds = {hold["id"]: hold for hold in snapshot["state"].get("holds") or ()}
+    vendors = VendorFile.from_state(snapshot["state"]["vendors"])
+    related = live_related(snapshot)
+    rejected = rejections(entries)
     refused: dict[str, dict[str, Any]] = {}
     for entry in entries:
         data = _data(entry)
@@ -573,6 +854,7 @@ def _live_attempts(
         request = data.get("request") if isinstance(data.get("request"), dict) else {}
         decision = data.get("decision") if isinstance(data.get("decision"), dict) else {}
         hold = holds.get(data.get("hold")) if data.get("hold") is not None else None
+        repeat = data.get("repeat") is True and hold is not None
 
         # What the bank answered follows the decision directly in the log.
         transfer_id, bank = None, None
@@ -584,9 +866,14 @@ def _live_attempts(
                     bank = _event(later)
                     transfer_id = _data(later).get("transfer")
                 break
+        approval = None
         if hold is not None:
             transfer_id = hold.get("transfer_id")
             status = {"pending": "held", "approved": "paid"}.get(hold["status"], hold["status"])
+            if hold["status"] == "pending":
+                shown = Hold.from_dict(hold)
+                approval = approval_view(shown, vendors,
+                                         related.get(hold["id"]) or _shown_related(shown))
             refusal = refused.get(hold["id"])
             if hold["status"] == "unknown":
                 refusal = {**hold["decision"], "outcome": "BLOCK", "rule": "BANK",
@@ -622,6 +909,11 @@ def _live_attempts(
                 hold=hold,
                 transfer_id=transfer_id,
                 status=status,
+                note=JOINED.format(hold=clean_label(hold["id"])) if repeat else "",
+                approval=approval,
+                rejected=rejected,
+                repeat=repeat,
+                transfers=snapshot["state"]["bank"]["transfers"],
             )
         )
     return attempts
@@ -672,16 +964,18 @@ def live_state(snapshot: Mapping[str, Any], *, db: str, inbox: str | None) -> di
     }
 
 
-def draft(instruction: str, vendor_names: Iterable[str]) -> dict[str, Any]:
+def draft(
+    instruction: str, vendors: VendorFile, payees: list[str] | None = None
+) -> dict[str, Any]:
     """What can be read out of a sentence before a task is confirmed.
 
-    A convenience for the person filling in the form: it changes nothing and
-    decides nothing. The person still ticks the payees.
+    A proposal for the person filling in the form: it changes nothing and
+    decides nothing. `draft_mandate` reads the sentence, the same function
+    the command line uses. "readings" lists every phrase it used or refused,
+    in words for the person; "digest" identifies exactly this proposal, and
+    a task started with it is refused if the proposal has changed since.
     """
-    names = list(vendor_names)
-    from .console import draft_payees  # the same suggestion the command line makes
-
-    payees = draft_payees(instruction, names)
+    proposal = draft_mandate(instruction, vendors, payees)
     found = find_ibans(instruction)
     amounts = []
     for match in _AMOUNT_IN_TEXT.finditer(instruction):
@@ -691,10 +985,57 @@ def draft(instruction: str, vendor_names: Iterable[str]) -> dict[str, Any]:
         if amount is not None:
             amounts.append(plain(amount))
     return {
-        "payees": payees,
+        "payees": list(proposal.payees),
+        "suggested": proposal.suggested,
+        # Vendors on file the sentence names that are not payees ("Hold off on Kestrel").
+        "mentioned": list(proposal.mentioned),
         "accounts": list(dict.fromkeys(iban.account for iban in found)),
         "amounts": list(dict.fromkeys(amounts)),
+        "bound": {payee: list(values) for payee, values in proposal.accounts.items()},
+        "asks": {payee: ask.to_dict() for payee, ask in proposal.asks.items()},
+        "readings": [reading.to_dict() for reading in proposal.readings],
+        "unbound": list(proposal.unbound),
+        # The same confirmation the command line prints, line by line.
+        "lines": describe_draft(proposal),
+        "digest": proposal.digest(),
+        "max_set_payments": MAX_SET_PAYMENTS,
+        # Per payee whose count is only the default: the drafter's line about it,
+        # for the form to show next to that payee's count box, and whether it
+        # warns that the sentence asks for several payments without a number.
+        "count_notes": {
+            payee: {"text": _for_the_form(note[0]), "several": note[1]}
+            for payee in proposal.asks
+            for note in [default_count_note(proposal, payee)] if note is not None
+        },
+        # Per payee whose count the sentence gives ("all three", "in two
+        # instalments"): the words, the count, and whether the payments are
+        # instalments of one invoice. Shown next to the count box.
+        "count_from": {
+            payee: {"quote": reading.quote, "payments": proposal.asks[payee].payments,
+                    "instalments": proposal.asks[payee].instalments}
+            for payee in proposal.asks
+            for reading in [count_reading(proposal, payee)]
+            if reading is not None and (proposal.asks[payee].payments or 0) > 1
+        },
+        # Per payee some of whose invoices the sentence leaves out ("don't pay
+        # the April one"): the words and what that does (rule S4). The form
+        # shows it as a banner on the payee instead of a plain reading line.
+        "excludes": {
+            payee: {"quote": reading.quote, "text": reading.result}
+            for payee in proposal.asks if proposal.asks[payee].excludes_some
+            for reading in [exclusion_reading(proposal, payee)] if reading is not None
+        },
     }
+
+
+# The drafter's default-count line names both screens' controls. On the form, the
+# box is right next to the line, so it says only that.
+_SET_THE_NUMBER = " To expect more, set the number:"
+
+
+def _for_the_form(text: str) -> str:
+    head, found, _ = text.partition(_SET_THE_NUMBER)
+    return head + " To expect more, type the number in the box." if found else text
 
 
 # --- the console --------------------------------------------------------------------
@@ -723,6 +1064,39 @@ def _flag(body: Mapping[str, Any], key: str) -> bool:
     value = body.get(key, False)
     if not isinstance(value, bool):
         raise ApiError(400, f"\"{key}\" must be true or false.")
+    return value
+
+
+def _wrong(body: Mapping[str, Any]) -> str | None:
+    """What the person says was wrong when they reject a hold: "account",
+    "payment", or nothing (the guard's default: the account, for a hold about
+    the account). The page always asks for a hold about the account."""
+    value = body.get("wrong")
+    if value is not None and value not in REJECT_CHOICES:
+        raise ApiError(400, "\"wrong\" must be \"account\" or \"payment\".")
+    return value
+
+
+def _check_wrong(hold: Hold, wrong: str | None) -> None:
+    """"The account is wrong" only means something for a hold about the
+    account (P1, P2, P3); for any other hold it is refused, so the audit log
+    never says an account was wrong when it was not the question."""
+    from .store import needs_typed_account
+
+    if wrong == "account" and not needs_typed_account(hold):
+        rules = ", ".join(hold.decision.rules or (hold.decision.rule,))
+        raise ApiError(409, f"Hold {clean_label(hold.id)} is held for {rules}, not for its "
+                            "account, so there is no account to refuse. Reject it without "
+                            "saying what was wrong.")
+
+
+def _typed_account(body: Mapping[str, Any]) -> str | None:
+    """The account a person typed back to approve a hold, or None."""
+    value = body.get("confirmed_account")
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 200:
+        raise ApiError(400, "\"confirmed_account\" must be text of at most 200 characters.")
     return value
 
 
@@ -867,16 +1241,25 @@ class App:
             )
 
     def _approve(self, hold_id: str, *, query: dict[str, str], body: dict[str, Any]) -> Any:
+        from .store import approve_hold, with_typed_back
+
         digest = _text(body, "digest", 200)
         attestation = _text(body, "attestation", 200, "")
         remember = _flag(body, "remember_account")
+        usual = _flag(body, "usual_amount")
+        typed = _typed_account(body)
+        if typed is not None and typed.strip():
+            attestation = with_typed_back(attestation)  # checked by approve_hold below
         with self._lock:
             lab, run = self._countersign_run()
             self._untampered(lab)
             try:
-                result = run.guard.approve(
-                    hold_id, APPROVER, remember_account=remember, digest=digest,
-                    attestation=attestation,
+                # The same checks as the live console and the command line: a hold
+                # about the account needs the account typed back (store.approve_hold).
+                result = approve_hold(
+                    run.guard, hold_id, approver=APPROVER, remember_account=remember,
+                    digest=digest, attestation=attestation, usual_amount=usual,
+                    confirmed_account=typed,
                 )
             except KeyError:
                 raise ApiError(404, f"There is no hold {clean_label(hold_id)}.") from None
@@ -905,8 +1288,10 @@ class App:
         with self._lock:
             lab, run = self._countersign_run()
             self._untampered(lab)
+            wrong = _wrong(body)
             try:
-                run.guard.reject(hold_id, APPROVER)
+                _check_wrong(run.guard.hold(hold_id), wrong)
+                run.guard.reject(hold_id, APPROVER, wrong=wrong)
             except KeyError:
                 raise ApiError(404, f"There is no hold {clean_label(hold_id)}.") from None
             except ValueError as exc:
@@ -1021,10 +1406,15 @@ class App:
     def _benchmark(self, *, query: dict[str, str], body: dict[str, Any]) -> Any:
         approver = query.get("approver", "none")
         if approver not in APPROVERS:
-            raise ApiError(400, "The approver must be none, careful or careless.")
+            raise ApiError(400, "The approver must be none, careful, procedural or careless.")
+        late = query.get("late", "0")
+        if late not in ("0", "1"):
+            raise ApiError(400, "\"late\" must be 0 (answer at once) or 1 (answer late).")
         from .benchmark import run_benchmark
 
-        return run_benchmark(approver=approver)
+        # Every suite, so the board is the README's benchmark, scenario for scenario.
+        return run_benchmark(approver=approver, late=late == "1",
+                             scenarios=scenarios.ALL_SCENARIOS)
 
     def _fuzz(self, *, query: dict[str, str], body: dict[str, Any]) -> Any:
         text = query.get("runs", "300")
@@ -1078,8 +1468,13 @@ class App:
 
     def _live_draft(self, *, query: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
         instruction = _text(body, "instruction")
-        vendors = self._with_store(lambda store: store.state())["vendors"]
-        return draft(instruction, [vendor["name"] for vendor in vendors])
+        payees = body.get("payees")
+        if payees is not None and not (
+            isinstance(payees, list) and all(isinstance(p, str) for p in payees)
+        ):
+            raise ApiError(400, "\"payees\" must be a list of text.")
+        vendors = VendorFile.from_state(self._with_store(lambda store: store.state())["vendors"])
+        return draft(instruction, vendors, payees)
 
     def _live_start(self, *, query: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
         hours = body.get("hours", 8)
@@ -1094,6 +1489,45 @@ class App:
         if not isinstance(accounts, dict):
             raise ApiError(400, "\"accounts\" must map a payee to its accounts.")
         instruction = _text(body, "instruction")
+        asks: dict[str, Ask] = {}
+        digest = body.get("draft_digest")
+        if digest is not None:
+            # The form confirms a draft. It is drafted again here, from the same
+            # sentence and payees, and must be the one the person was shown.
+            if not all(isinstance(p, str) for p in payees):
+                raise ApiError(400, "\"payees\" and \"references\" must be lists of text.")
+            vendors = VendorFile.from_state(
+                self._with_store(lambda store: store.state())["vendors"]
+            )
+            proposal = draft_mandate(instruction, vendors, payees)
+            if digest != proposal.digest():
+                raise ApiError(409, "The sentence, the payees or the vendor file changed after "
+                                    "the draft was shown. Check the draft again.")
+            accounts = {payee: list(values) for payee, values in proposal.accounts.items()}
+            asks = dict(proposal.asks)
+        # What the person set for one payee on the confirmation screen, on top of
+        # the draft: {"Payee": {"payments": 3, "amount": "650.00"}}. Only a value
+        # the person typed is sent; it replaces what was read for that payee only.
+        adjust = body.get("adjust") or {}
+        if not isinstance(adjust, dict) or not all(
+            isinstance(name, str) and isinstance(change, dict)
+            and set(change) <= {"payments", "amount"} for name, change in adjust.items()
+        ):
+            raise ApiError(400, "\"adjust\" must map a payee to {\"payments\", \"amount\"}.")
+        counts = {name: change["payments"] for name, change in adjust.items()
+                  if change.get("payments") is not None}
+        amounts = {name: change["amount"] for name, change in adjust.items()
+                   if change.get("amount") is not None}
+        if not all(isinstance(value, str) for value in amounts.values()):
+            raise ApiError(400, "An amount must be text such as \"650.00\".")
+        if counts or amounts:
+            if not all(isinstance(p, str) for p in payees):
+                raise ApiError(400, "\"payees\" and \"references\" must be lists of text.")
+            try:
+                asks, _ = adjust_asks(asks, payees, payments=counts, amounts=amounts,
+                                      budget=_limit(body, "max_total"))
+            except ValueError as exc:
+                raise ApiError(400, _sentence(exc)) from None
         typed = {match.account for match in find_ibans(instruction)}
         for values in accounts.values():
             for value in values if isinstance(values, list) else [values]:
@@ -1113,9 +1547,12 @@ class App:
                 max_payments=body.get("max_payments"),
                 references=tuple(references),
                 accounts=accounts,
+                asks=asks,
             )
+            # The digest of the draft the person confirmed goes into the log.
             self._with_store(
-                lambda s: s.console().start_task(mandate, confirmed_by=APPROVER)
+                lambda s: s.console().start_task(mandate, confirmed_by=APPROVER,
+                                                 draft_digest=digest)
             )
         except (ValueError, TypeError) as exc:
             raise ApiError(400, _sentence(exc)) from None
@@ -1129,11 +1566,19 @@ class App:
         digest = _text(body, "digest", 200)
         attestation = _text(body, "attestation", 200, "")
         remember = _flag(body, "remember_account")
+        usual = _flag(body, "usual_amount")
+        typed = _typed_account(body)
+        if typed is not None and typed.strip():
+            from .store import with_typed_back
+
+            attestation = with_typed_back(attestation)  # checked by the store below
 
         def approve(store: Any) -> Any:
+            # Store.console().approve checks the typed-back account in the same
+            # transaction as the approval: the page is not the control.
             return store.console().approve(
                 hold_id, approver=APPROVER, digest=digest, attestation=attestation,
-                remember_account=remember,
+                remember_account=remember, usual_amount=usual, confirmed_account=typed,
             )
 
         try:
@@ -1147,8 +1592,14 @@ class App:
         return self._live_now()
 
     def _live_reject(self, hold_id: str, *, query: dict[str, str], body: dict[str, Any]) -> Any:
+        wrong = _wrong(body)
+
+        def reject(store: Any) -> None:
+            _check_wrong(store.hold(hold_id), wrong)
+            store.console().reject(hold_id, approver=APPROVER, wrong=wrong)
+
         try:
-            self._with_store(lambda store: store.console().reject(hold_id, approver=APPROVER))
+            self._with_store(reject)
         except KeyError:
             raise ApiError(404, f"There is no hold {clean_label(hold_id)}.") from None
         except ValueError as exc:
@@ -1212,9 +1663,14 @@ def make_handler(app: App, token: str) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             if close:
                 self.send_header("Connection", "close")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(data)
+            try:
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                # The browser closed the connection (a tab closed, a page left)
+                # before the answer was sent. Nobody is waiting for it.
+                self.close_connection = True
 
         def _refuse(self, status: int, message: str) -> None:
             """Answer without reading whatever the client is still sending."""

@@ -70,6 +70,7 @@ label { cursor: pointer; }
 .tag-gap { color: var(--ink); border: 1px dashed var(--ink); text-transform: uppercase; }
 .chip { display: inline-block; padding: 1px 8px; border: 1px solid var(--line); border-radius: 99px; font-size: 12px; background: var(--bg); }
 .chip b { font-weight: 600; }
+.chip.chip-hold { color: var(--hold); background: var(--hold-bg); border-color: var(--hold); }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 12px; font-weight: 800; letter-spacing: 0.04em; white-space: nowrap; }
 .badge.allow { color: var(--allow); background: var(--allow-bg); }
 .badge.hold { color: var(--hold); background: var(--hold-bg); }
@@ -194,6 +195,14 @@ main { padding: 8px 12px 28px; }
 .pill.held { background: var(--hold-bg); border-color: var(--hold); } .pill.held .pill-st { color: var(--hold); }
 .pill.blocked { border-color: var(--block); color: var(--muted); } .pill.blocked .pill-st { color: var(--block); }
 .pill.selected { box-shadow: 0 0 0 2px var(--accent); }
+.pill.joined { border-style: dashed; border-color: var(--hold); color: var(--muted); } .pill.joined .pill-st { color: var(--hold); }
+.pill-t { font-family: var(--sans); font-weight: 800; font-size: 9px; color: var(--muted); }
+.pill.lost .pill-t { color: inherit; opacity: 0.85; }
+/* Where a new task starts in a station: a short labelled rule, inline with the pills. */
+.task-div { display: inline-flex; align-self: flex-start; align-items: center; min-height: 17px; padding-left: 6px; border-left: 2px solid var(--line-2); font: 800 9.5px var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+.task-group { display: inline-flex; flex-wrap: wrap; gap: 3px 6px; align-items: flex-start; max-width: 100%; }
+/* A pill keeps its one line: it never shrinks below its text inside a wrapping row. */
+.pillbox { flex: none; max-width: 100%; }
 .truth { font-size: 10px; font-style: italic; color: var(--muted); border: 1px dashed var(--line-2); border-radius: 3px; padding: 0 4px; white-space: nowrap; }
 .truth.unwanted { color: var(--ink); border-color: var(--ink); }
 .flyer { position: absolute; left: 0; top: 0; z-index: 3; pointer-events: none; font: 700 11px/1.6 var(--mono); padding: 0 8px; border-radius: 99px; background: var(--ink); color: var(--panel); white-space: nowrap; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3); }
@@ -201,6 +210,21 @@ main { padding: 8px 12px 28px; }
 .flyer.blocked { background: var(--block); }
 .caption { min-height: 46px; margin-top: 6px; padding: 4px 10px; border-left: 3px solid var(--ink); background: var(--panel); border-radius: 0 5px 5px 0; font-size: 13px; }
 .caption .gone { color: var(--block); font-weight: 700; display: block; }
+.caption .task-start { font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; font-size: 12px; }
+.stage-notice:empty { display: none; }
+.stage-notice { margin-top: 6px; }
+.stage-notice .banner { margin-bottom: 0; }
+.task-strip { list-style: none; margin: 0 0 7px; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.task-strip li { display: inline-flex; align-items: baseline; gap: 3px; }
+.task-strip li + li::before { content: ""; width: 12px; border-top: 1px solid var(--line-2); align-self: center; margin-right: 4px; }
+.task-strip button { font: 600 12px var(--sans); color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 1px 7px; cursor: pointer; }
+.task-strip button[aria-pressed="true"] { color: var(--ink); border-color: var(--ink); background: var(--bg); }
+/* One task per row, with its own payees and limits next to its button. */
+.task-strip { display: grid; gap: 3px; }
+.task-strip li { display: flex; flex-wrap: wrap; gap: 2px 6px; min-width: 0; }
+.task-strip li + li::before { content: none; }
+.task-strip .task-terms { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; min-width: 0; }
+.task-strip li.on .task-terms { color: var(--ink); }
 .legend { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
 .legend .truth { font-style: italic; }
 
@@ -228,6 +252,9 @@ main { padding: 8px 12px 28px; }
 .origin-row h4 { font-size: 13px; }
 .origin-row .body { grid-column: 2; font-size: 12.5px; overflow-wrap: anywhere; }
 .sighting { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; margin-top: 3px; }
+/* A document's name is the sender's words: quoted, small, labelled, never a heading. */
+.doc-name { font-weight: 400; overflow-wrap: anywhere; }
+.doc-name-label { font-size: 11.5px; color: var(--muted); }
 .facts { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
 
 /* ---- inbox ---- */
@@ -244,11 +271,36 @@ main { padding: 8px 12px 28px; }
 .attest label { display: flex; gap: 7px; align-items: baseline; }
 .hold-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
 .decided { border: 1px solid var(--line); border-radius: 5px; padding: 5px 10px; margin-bottom: 6px; font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+/* The rules a hold carries, one per line (not ".held": that is the held pill on the Stage). */
+.held-rules { list-style: none; margin: 3px 0 6px; padding: 0; display: grid; gap: 3px; font-size: 12.5px; overflow-wrap: anywhere; }
+.held-rules .tag { margin-right: 2px; }
+.facts-box { margin: 6px 0; font-size: 12.5px; }
+.facts-box summary { cursor: pointer; font-size: 12px; font-weight: 700; color: var(--muted); }
+.facts-list { margin: 4px 0 0; padding-left: 18px; font-size: 12.5px; overflow-wrap: anywhere; }
+.facts-list li { margin-bottom: 2px; }
+.attest.confirm { border-color: var(--hold); background: var(--hold-bg); }
+.attest.confirm label.field { display: grid; margin: 2px 0 0; }
+.typed-account { font-size: 14px; letter-spacing: 0.04em; text-transform: uppercase; }
+.typed-account::placeholder { text-transform: none; letter-spacing: 0; }
+.remember { display: flex; gap: 7px; align-items: baseline; font-size: 12.5px; margin: 4px 0; }
+.sighting .tag { margin-left: 2px; }
+.acct.rendered { text-decoration-style: dashed; }
+.related-box { border: 1px solid var(--line); border-radius: 5px; padding: 6px 10px; margin: 6px 0; display: grid; gap: 5px; background: var(--bg); }
+.related-box .banner { margin-bottom: 0; }
+.rule-tags { display: inline-flex; flex-wrap: wrap; gap: 3px 4px; vertical-align: baseline; }
+.rule-tags .tag { white-space: normal; }
+.on-reject { margin-top: 6px; }
+/* Rejecting a hold about the account: the person says what was wrong; nothing is chosen for them. */
+.reject-choice { border-color: var(--line-2); }
+.reject-choice label { font-size: 12.5px; overflow-wrap: anywhere; }
+.reject-choice label strong { font-weight: 700; }
+.found-box summary { color: var(--hold); }
+.quarantine strong { text-transform: uppercase; letter-spacing: 0.03em; }
 .tools-chip { font-size: 12px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 5px; margin-bottom: 10px; background: var(--bg); }
 
 /* ---- scoreboard ---- */
 .score-controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 10px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin: 8px 0 12px; }
 .tile h3 { font-size: 14px; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .tile .big { font-size: 30px; font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; margin-top: 4px; }
 .tile .big.bad { color: var(--block); } .tile .big.good { color: var(--allow); }
@@ -266,6 +318,9 @@ main { padding: 8px 12px 28px; }
 .matrix th[scope="row"] { font-weight: 500; min-width: 220px; }
 .matrix th[scope="row"] .mono { color: var(--muted); margin-right: 6px; }
 .matrix tr.group th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); padding-top: 10px; }
+.matrix tr.suite-head th { font-size: 14px; font-weight: 700; padding-top: 16px; border-bottom: 2px solid var(--ink); }
+.matrix .suite-note { font-size: 12px; font-weight: 500; color: var(--muted); }
+.matrix.by-suite th[scope="row"] { min-width: 160px; }
 .cell { font: inherit; display: block; width: 100%; text-align: left; border: 1px solid transparent; border-radius: 4px; padding: 2px 7px; cursor: pointer; font-weight: 700; background: transparent; color: inherit; }
 .cell small { display: block; font-weight: 500; color: var(--muted); font-size: 11px; }
 .cell.allow { color: var(--allow); background: var(--allow-bg); }
@@ -304,6 +359,7 @@ main { padding: 8px 12px 28px; }
 .chain .hashes { font: 11px var(--mono); color: var(--muted); white-space: nowrap; }
 .chain li.bad { border-color: var(--block); background: var(--block-bg); }
 .chain li.bad .flag { color: var(--block); font-weight: 800; grid-column: 2 / -1; }
+.chain li.notable { border-left: 4px solid var(--hold); background: var(--hold-bg); }
 .live-col .chain li { grid-template-columns: 30px minmax(110px, 150px) 1fr; }
 .live-col .chain .hashes { grid-column: 2 / -1; white-space: normal; }
 #view-live .live-grid { margin-bottom: 10px; }
@@ -316,12 +372,27 @@ main { padding: 8px 12px 28px; }
 .attempt-row { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 10px; width: 100%; text-align: left; font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px; margin-bottom: 5px; cursor: pointer; }
 .attempt-row:hover { border-color: var(--accent); }
 .attempt-row .sub { grid-column: 2 / -1; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.attempt-row .why { display: block; color: var(--ink); font-weight: 600; }
 .pre { font: 11.5px/1.45 var(--mono); background: var(--code); border-radius: 5px; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
 .ledger { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .ledger th, .ledger td { text-align: left; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--line); }
 .ledger th { color: var(--muted); font-size: 11.5px; }
 .checks { display: grid; gap: 3px; margin-bottom: 8px; }
-.draft { border: 1px dashed var(--line-2); border-radius: 5px; padding: 6px 10px; font-size: 12.5px; margin-bottom: 8px; }
+.draft { border: 1px dashed var(--line-2); border-radius: 5px; padding: 6px 10px; font-size: 12.5px; margin-bottom: 8px; display: grid; gap: 6px; }
+.draft-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; justify-content: space-between; }
+.draft .banner { margin-bottom: 0; }
+.readings { margin: 2px 0 0; padding-left: 18px; overflow-wrap: anywhere; }
+.readings li { margin-bottom: 2px; }
+.payee-block { border: 1px solid var(--line); border-radius: 5px; padding: 6px 8px; background: var(--bg); }
+.payee-block h4 { font-size: 13px; }
+.adjust { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; margin-top: 5px; font-size: 12.5px; }
+.adjust input { width: auto; }
+.adjust .note { flex-basis: 100%; }
+.adjust-count { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
+.adjust .count-note { flex-basis: 100%; margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+.adjust .count-note.banner { font-size: 12.5px; padding: 6px 10px; }
+.payee-block .banner.excluded { font-size: 12.5px; font-weight: 500; padding: 6px 10px; margin: 4px 0; overflow-wrap: anywhere; }
+.payee-block .banner.excluded strong { font-weight: 700; }
 
 /* ---- layout: the Stage fits one screen on a laptop or projector ---- */
 @media (min-width: 1100px) {
@@ -330,7 +401,8 @@ main { padding: 8px 12px 28px; }
 @media (min-width: 1100px) and (min-height: 620px) {
   body.on-stage { height: 100vh; overflow: hidden; }
   body.on-stage main { height: calc(100vh - var(--top)); padding-bottom: 8px; }
-  body.on-stage #view-stage { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+  /* minmax(0, 1fr): a long scenario summary (nowrap, ellipsis) must not widen the page. */
+  body.on-stage #view-stage { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }
   body.on-stage .stage-grid { min-height: 0; }
   body.on-stage .stage-left { grid-template-rows: auto minmax(0, 1fr); min-height: 0; align-content: stretch; }
   body.on-stage .stage-right { min-height: 0; overflow: auto; padding: 1px 3px 1px 1px; }

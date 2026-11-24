@@ -88,9 +88,12 @@ class ReplayTests(unittest.TestCase):
     def test_the_order_of_calls_is_fixed(self):
         scenario = BY_ID["attack-05"]
         transcript, _, _ = replay(scenario, "countersign")
+        # Changed (fix3): both payments now wait (the 240.00 is in hidden text, T1),
+        # so the agent asks about two holds.
         self.assertEqual(
             [call.tool for call in transcript],
-            ["get_task", "list_documents", "read_document", "pay", "pay", "payment_status"],
+            ["get_task", "list_documents", "read_document", "pay", "pay", "payment_status",
+             "payment_status"],
         )
         self.assertTrue(all(isinstance(call, Call) for call in transcript))
         self.assertEqual(transcript[2].arguments, {"name": "INV-2041.eml"})
@@ -101,6 +104,7 @@ class ReplayTests(unittest.TestCase):
              "reference": first.reference},
         )
         self.assertEqual(transcript[5].arguments, {"hold_id": "H001"})
+        self.assertEqual(transcript[6].arguments, {"hold_id": "H002"})
         self.assertFalse(any(call.is_error for call in transcript))
 
     def test_it_reads_what_the_inbox_lists_not_what_the_scenario_says(self):
@@ -180,6 +184,19 @@ class CommandTests(unittest.TestCase):
     def agent(self, *more: str) -> tuple[int, str, str]:
         return run_cli("agent", "--db", self.db, "--inbox", self.inbox, "--delay", "0", *more)
 
+    def test_every_rule_of_a_held_payment_is_printed(self):
+        # benign-13 against the attack-02 inbox plus its own document: P2 and A2.
+        new_supplier = BY_ID["benign-13"]
+        for name, text in new_supplier.documents.items():
+            with open(os.path.join(self.inbox, name), "w", encoding="utf-8", newline="") as fp:
+                fp.write(text)
+        now = datetime.now(timezone.utc)
+        self.store.console().start_task(scenario_mandate(new_supplier, lambda: now),
+                                        confirmed_by="tester")
+        code, out, err = self.agent("--scenario", "benign-13")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("-> HOLD P2 A2  hold H001", out)
+
     def test_it_runs_against_the_active_task_and_prints_every_call(self):
         self.start()
         code, out, err = self.agent("--scenario", "attack-02")
@@ -234,6 +251,20 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(err.count("\n"), 1)
         self.assertFalse(os.path.exists(missing))
         self.assertEqual(self.store.head(), head)
+
+    def test_a_scenario_of_several_tasks_is_refused_with_a_reason(self):
+        self.start()
+        head = self.store.head()
+        code, out, err = self.agent("--scenario", "review-A02")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("scenario review-A02 has 4 tasks", err)
+        self.assertIn("Starting the next task is a person's job", err)
+        self.assertEqual(err.count("\n"), 1)
+        self.assertEqual(self.store.head(), head)
+        # The list of scenarios it offers has one task each.
+        _, _, err = self.agent("--scenario", "nope")
+        self.assertNotIn("review-A02", err)
+        self.assertIn("attack-02", err)
 
     def test_the_default_delay_lets_a_person_watch(self):
         self.start()

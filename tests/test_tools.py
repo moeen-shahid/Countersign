@@ -817,7 +817,8 @@ class EndToEndTests(unittest.TestCase):
 
         # A person countersigns, in another process: this one.
         hold = store.hold("H001")
-        result = store.console().approve(hold.id, approver="tester", digest=hold.digest)
+        result = store.console().approve(hold.id, approver="tester", digest=hold.digest,
+                                         confirmed_account=fmt(MULE_2))
         self.assertEqual(result.transfer_id, "T001")
 
         after = client.tool("payment_status", {"hold_id": "H001", "wait_seconds": 5})

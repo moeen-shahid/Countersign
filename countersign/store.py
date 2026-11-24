@@ -24,6 +24,16 @@ both pass a check that only one of them should pass.
 up a hold. Starting a task and deciding a hold are on `Console` only, and
 agent-facing modules never hold one.
 
+`Console.approve` also checks what a person must do before a hold is passed
+to the guard (`approve_hold`), in the same transaction: a hold about the
+account (P1, P2, P3) needs the whole account typed back as the vendor
+confirmed it, and only a hold about the amount (A1, A2) can be marked as the
+payee's new usual amount. The guard compares the typed account
+(`Guard.approve(confirmed_account=...)`) and logs a mismatch
+(`hold_confirmation_failed`); that entry is kept although the approval is
+refused. The command line and the web console both go through it, so the
+check does not depend on a page.
+
 Limits, stated plainly:
 
 * The boundary is between modules, not between operating-system users. A
@@ -64,9 +74,16 @@ from .audit import (
 )
 from .audit import verify_entries
 from .bank import MockBank
-from .guard import Guard, Hold, PayResult
+from .guard import (  # noqa: F401 - ApprovalRefused is part of this module's interface
+    ApprovalRefused,
+    ConfirmationFailed,
+    Guard,
+    Hold,
+    PayResult,
+    confirmation_problem,
+)
 from .models import Mandate
-from .policy import GUARD_MODES
+from .policy import DESTINATION_RULES, GUARD_MODES
 from .toolsurface import hold_view, pay_view, task_view
 from .vendors import Vendor, VendorFile
 
@@ -81,11 +98,13 @@ RECEIPT_EVENTS = frozenset(
     {
         "task_started",
         "task_ended",
+        "task_quarantined",
         "hold_approved",
         "hold_rejected",
         "payment_executed",
         "payment_unknown",
         "vendor_account_added",
+        "vendor_account_removed",
     }
 )
 
@@ -264,12 +283,141 @@ class AgentPort:
         return None
 
 
+# --- what the person's side asks before a hold is approved ---------------------------
+#
+# Every way a person approves a hold (the command line, the web console's live
+# view and its lab) goes through `approve_hold`, so these checks hold for the
+# API as well as for the page. The benchmark's approver models call
+# `Guard.approve` directly: they are models of a person, not a person.
+
+# Holds whose question is the account (P1, P2, P3). To countersign one, the
+# person types back the whole account the vendor confirmed through a channel
+# they already trusted, and it must be the account in the hold. The whole
+# account: a look-alike can share the first twelve and the last four
+# characters with the real one (adversary trace D01).
+ACCOUNT_RULES = frozenset(DESTINATION_RULES)
+# Holds about the amount, where the person may say "this is the new usual amount".
+AMOUNT_RULES = frozenset({"A1", "A2"})
+# Holds where the account is not on file for the payee, so it can be remembered.
+NEW_ACCOUNT_RULES = frozenset({"P1", "P2"})
+TYPED_BACK = "typed back the account the vendor confirmed, and it matched this payment's account"
+
+
+def with_typed_back(attestation: str) -> str:
+    """The attestation a person's screen records after the account was typed
+    back and matched (`approve_hold` checks the match; this only words it)."""
+    note = str(attestation or "").strip()
+    return f"{note}; {TYPED_BACK}" if note else TYPED_BACK
+
+
+def needs_typed_account(hold: Hold) -> bool:
+    """True when approving this hold needs the account typed back (P1, P2, P3)."""
+    return bool(ACCOUNT_RULES & set(hold.decision.rules))
+
+
+def offers_usual_amount(hold: Hold) -> bool:
+    """True when the hold is about the amount (A1, A2), so it can be marked usual."""
+    return bool(AMOUNT_RULES & set(hold.decision.rules))
+
+
+def offers_remember_account(hold: Hold) -> bool:
+    """True when the account is not on file for the payee (P1, P2)."""
+    return bool(NEW_ACCOUNT_RULES & set(hold.decision.rules))
+
+
+def approval_problem(
+    hold: Hold, *, confirmed_account: object = None, usual_amount: bool = False
+) -> str | None:
+    """Why the person's side will not pass this approval to the guard, or None.
+
+    * A hold about the account needs the account typed back. The typed text
+      is read as one IBAN (spaces and case do not matter) and compared with
+      the hold's account as a whole (`guard.confirmation_problem`, the one
+      comparison). Nothing is pre-filled and no part of it is enough.
+    * An account typed for any other hold must match too.
+    * Only a hold about the amount can be marked as the new usual amount.
+
+    This only answers; it logs nothing. `approve_hold` leaves the comparison
+    to `Guard.approve`, which logs a mismatch.
+    """
+    problem = _before_the_guard(hold, confirmed_account, usual_amount)
+    if problem is not None:
+        return problem
+    if confirmed_account is not None and str(confirmed_account).strip():
+        return confirmation_problem(hold, confirmed_account)
+    return None
+
+
+def _before_the_guard(hold: Hold, confirmed_account: object, usual_amount: bool) -> str | None:
+    """What the person's side refuses without asking the guard: text that is not
+    text, no account typed for a hold about the account, a usual-amount mark on
+    a hold that is not about the amount."""
+    if confirmed_account is not None and not isinstance(confirmed_account, str):
+        return "The confirmed account must be text."
+    typed = confirmed_account.strip() if isinstance(confirmed_account, str) else ""
+    rules = set(hold.decision.rules)
+    if rules & ACCOUNT_RULES and not typed:
+        codes = ", ".join(rule for rule in hold.decision.rules if rule in ACCOUNT_RULES)
+        return (
+            f"Hold {hold.id} is held because of its account ({codes}). To countersign it, "
+            "type the whole account the vendor confirmed to you through a channel you already "
+            "trusted, such as a phone number you already had. Nothing was paid."
+        )
+    if usual_amount and not rules & AMOUNT_RULES:
+        return (
+            f"Hold {hold.id} is not held because of its amount (A1, A2), so there is no "
+            "amount to mark as usual. Nothing was paid."
+        )
+    return None
+
+
+def approve_hold(
+    guard: Guard,
+    hold_id: str,
+    *,
+    approver: str,
+    digest: str | None = None,
+    attestation: str = "",
+    remember_account: bool = False,
+    usual_amount: bool = False,
+    confirmed_account: str | None = None,
+) -> PayResult:
+    """Countersign one hold for a person: the person's-side checks, then
+    `Guard.approve`, which compares the typed account.
+
+    Raises `ApprovalRefused` (a ValueError) before the guard is asked when
+    the person's side refuses, `ConfirmationFailed` (an ApprovalRefused) when
+    the typed account is not the hold's (the guard has logged that), and
+    whatever else `Guard.approve` raises. A stale digest is left to the
+    guard, so that it is reported as such. The attestation is passed on as it
+    is: the screens word it (`with_typed_back`), so that an approval made here
+    logs exactly what the same approval made on the guard in memory logs.
+    """
+    hold = guard.hold(hold_id)  # KeyError for an unknown hold
+    typed = None
+    if hold.status == "pending" and (digest is None or digest == hold.digest):
+        problem = _before_the_guard(hold, confirmed_account, usual_amount)
+        if problem is not None:
+            raise ApprovalRefused(problem)
+        typed = confirmed_account if confirmed_account and confirmed_account.strip() else None
+    return guard.approve(
+        hold_id,
+        approver,
+        remember_account=remember_account,
+        digest=digest,
+        attestation=attestation,
+        usual_amount=usual_amount,
+        confirmed_account=typed,
+    )
+
+
 class Console:
     """The person's side: starting and ending tasks, deciding holds.
 
     Every method is one unit of work. What the guard raises (an unknown hold
     is KeyError; a hold already decided, from an earlier task or changed since
-    it was displayed is ValueError) is raised here after the roll back.
+    it was displayed is ValueError) is raised here after the roll back, and
+    so is `ApprovalRefused` (a ValueError) from the checks of `approve_hold`.
     """
 
     __slots__ = ("_store",)
@@ -277,8 +425,22 @@ class Console:
     def __init__(self, store: Store) -> None:
         self._store = store
 
-    def start_task(self, mandate: Mandate, *, confirmed_by: str) -> None:
-        self._store._write(lambda guard: guard.start_task(mandate, confirmed_by=confirmed_by))
+    def start_task(
+        self, mandate: Mandate, *, confirmed_by: str, draft_digest: str | None = None
+    ) -> None:
+        """Start a task. `draft_digest` is the digest of the draft the person
+        confirmed (`Draft.digest()`), logged with the task."""
+        self._store._write(lambda guard: guard.start_task(
+            mandate, confirmed_by=confirmed_by, draft_digest=draft_digest))
+
+    def check_account(
+        self, hold_id: str, confirmed_account: object, *, approver: str
+    ) -> str | None:
+        """Compare the account a person typed back with a waiting hold, before
+        asking them to approve it: None when it matches, else the reason. A
+        mismatch is logged (`hold_confirmation_failed`) and that is kept."""
+        return self._store._write(
+            lambda guard: guard.check_confirmation(hold_id, confirmed_account, approver))
 
     def end_task(self, *, by: str) -> None:
         self._store._write(lambda guard: guard.end_task(by=by))
@@ -291,20 +453,36 @@ class Console:
         digest: str | None = None,
         attestation: str = "",
         remember_account: bool = False,
+        usual_amount: bool = False,
+        confirmed_account: str | None = None,
     ) -> PayResult:
-        """Countersign one hold. See `Guard.approve` for what the result can be."""
+        """Countersign one hold. See `approve_hold` and `Guard.approve` for what
+        the result can be.
+
+        `confirmed_account` is the account the person typed back; a hold about
+        the account (P1, P2, P3) is refused without it, or when it is not the
+        hold's account (`ConfirmationFailed`; the attempt stays in the log).
+        `usual_amount` marks the amount as a usual amount for the payee (rules
+        A1, A2), only on a hold about the amount; without it, an amount outside
+        the usual range does not move the line."""
         return self._store._write(
-            lambda guard: guard.approve(
+            lambda guard: approve_hold(
+                guard,
                 hold_id,
-                approver,
-                remember_account=remember_account,
+                approver=approver,
                 digest=digest,
                 attestation=attestation,
+                remember_account=remember_account,
+                usual_amount=usual_amount,
+                confirmed_account=confirmed_account,
             )
         )
 
-    def reject(self, hold_id: str, *, approver: str) -> None:
-        self._store._write(lambda guard: guard.reject(hold_id, approver))
+    def reject(self, hold_id: str, *, approver: str, wrong: str | None = None) -> None:
+        """Refuse a held payment. `wrong` is what the person says was wrong,
+        "account" or "payment" (`Guard.reject`); None keeps the guard's default:
+        for a hold about the account, the account."""
+        self._store._write(lambda guard: guard.reject(hold_id, approver, wrong=wrong))
 
 
 class Store:
@@ -505,6 +683,13 @@ class Store:
                 return hold
         raise KeyError(hold_id)
 
+    def related(self, hold_id: str) -> dict[str, Any]:
+        """What a person deciding this hold should see next to it now: rival
+        payments of the same invoice (D3) and the waiting payments it needs
+        room with (H2), computed from the current state (`Guard.related`).
+        Raises KeyError if there is no such hold. Changes nothing."""
+        return Guard.from_state(self.state(), clock=self._clock).related(hold_id)
+
     def snapshot(self, after_seq: int = -1) -> dict[str, Any]:
         """Everything a live console shows, read at one moment.
 
@@ -583,7 +768,13 @@ class Store:
                 raise StoreError(
                     f"The database at {self.path} could not be opened for writing ({exc})."
                 ) from None
-            result = work(guard)
+            kept: ConfirmationFailed | None = None
+            try:
+                result = work(guard)
+            except ConfirmationFailed as refused:
+                # The approval is refused, but the guard logged why; keep that
+                # entry (nothing else changed) and raise after the commit.
+                kept, result = refused, None
             if log.failed is not None:
                 # The guard answered, but an entry is missing. Keep nothing.
                 raise StoreError(
@@ -601,6 +792,8 @@ class Store:
         finally:
             _end(conn)  # rolls back unless the commit went through
         self._anchor(log.added)
+        if kept is not None:
+            raise kept
         return result
 
     def _anchor(self, added: list[Entry], always: bool = False) -> None:
