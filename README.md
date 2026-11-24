@@ -97,7 +97,7 @@ Some design choices worth knowing:
 - Accounts are matched as whole, checksum-valid IBANs. Matching is never by substring.
 - A countersignature covers one payment. It does not add the account to the vendor file unless the person ticks that box separately.
 - Approval re-checks every rule, so even a careless approver cannot break the mandate's limits.
-- A1's baseline is frozen when the task starts, so the agent cannot raise its own ceiling.
+- A1's baseline is frozen when the task starts, so within a task the agent cannot raise its own ceiling. Across tasks it still can, a step at a time: every unattended payment joins the history the next task's baseline is taken from. This is a known gap.
 - Every decision goes into a hash-chained audit log. Each money-moving step can also leave a receipt outside the database.
 
 The comparison guards are **Allowlist + caps**, which runs the mandate rules only (M0–M6 and F1), and **Account allowlist + caps**, which adds B1: refuse any account not on file. Both are our own implementations of common designs.
@@ -224,13 +224,9 @@ Before this version we red-teamed v0.1 with runnable proofs of concept. The seri
 - [CaMeL](https://arxiv.org/abs/2503.18813) ("Defeating Prompt Injections by Design") tracks data flow through an interpreter instead of detecting injections. Countersign applies a much simpler version of that idea at one place, the payment: it matches account values rather than tracking flow through the model.
 - [AgentDojo](https://arxiv.org/abs/2406.13352) measures live models under attack. Our benchmark replays a worst-case scripted agent, so it measures the guard, not how often a model is fooled.
 
-## Team
-
-_Add team members here._
-
 ## AI assistance
 
-The code, tests and this README were written with Claude Code (Anthropic). _Team: describe here what you reviewed, changed and added._
+The code, tests and this README were written with Claude Code (Anthropic).
 
 ## License
 

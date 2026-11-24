@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import http.client
-import importlib
-import inspect
 import io
 import json
 import os
@@ -26,7 +24,7 @@ from dataclasses import replace
 from decimal import Decimal
 from importlib import resources
 
-from countersign import __version__, benchmark, dashboard, scenarios
+from countersign import __version__, dashboard, scenarios
 from countersign.audit import verify_entries
 from countersign.dashboard import App, Download
 from countersign.iban import find_ibans, fmt_iban
@@ -40,23 +38,6 @@ MULE = "LT121000011101001000"
 MULE_B = "MT84MALT011000012345MTLCAST001S"
 FERNHILL = "NL91ABNA0417164300"
 TOKEN = "test-token-123456789"
-
-
-def _available(module: str, name: str | None = None) -> bool:
-    try:
-        found = importlib.import_module(f"countersign.{module}")
-    except ImportError:
-        return False
-    return name is None or hasattr(found, name)
-
-
-HAVE_STORE = _available("store")
-HAVE_DOCS = _available("scenarios", "scenario_from_doc") and _available(
-    "scenarios", "scenario_to_doc"
-)
-HAVE_FUZZ = _available("fuzz", "run_fuzz")
-HAVE_ATTACKERS = _available("scenarios", "ATTACKER_ACCOUNTS")
-HAVE_APPROVERS = "approver" in inspect.signature(benchmark.run_benchmark).parameters
 
 
 # --- a small checker for the shapes in the contract ---------------------------------
@@ -376,9 +357,8 @@ class LabTests(ShapeMixin, unittest.TestCase):
             self.assertEqual(len(hidden), 1)
             self.assertTrue(hidden[0][0] <= by_account[MULE_B]["start"] < hidden[0][1])
             self.assertFalse(hidden[0][0] <= by_account[NIMBUS]["start"] < hidden[0][1])
-        if HAVE_ATTACKERS:
-            self.assertIs(by_account[MULE_B]["attacker"], True)
-            self.assertIs(by_account[NIMBUS]["attacker"], False)
+        self.assertIs(by_account[MULE_B]["attacker"], True)
+        self.assertIs(by_account[NIMBUS]["attacker"], False)
 
     def test_attempts_show_the_raw_and_the_canonical_account(self):
         raw = "  mt84 malt 0110 0001 2345 mtlc ast0 01s "
@@ -421,9 +401,8 @@ class LabTests(ShapeMixin, unittest.TestCase):
         ours = state["runs"]["countersign"]
         self.assertEqual([t["unauthorised"] for t in ours["transfers"]], [False])
         self.assertEqual((ours["unauthorised"], ours["to_attacker"]), ("0.00", "0.00"))
-        if HAVE_ATTACKERS:
-            self.assertEqual(unguarded["to_attacker"], "240.00")
-            self.assertEqual([a["to_attacker"] for a in unguarded["attempts"]], [False, True])
+        self.assertEqual(unguarded["to_attacker"], "240.00")
+        self.assertEqual([a["to_attacker"] for a in unguarded["attempts"]], [False, True])
 
     def test_offsets_are_counted_the_way_a_browser_counts(self):
         text = "\U0001F389 Party invoice \U0001F389\n" + invoice(MULE)
@@ -724,7 +703,6 @@ class TamperTests(ShapeMixin, unittest.TestCase):
 # --- playground, benchmark, invariant check -------------------------------------------
 
 
-@unittest.skipUnless(HAVE_DOCS, "scenarios.scenario_from_doc is not in this build yet")
 class PlaygroundTests(ShapeMixin, unittest.TestCase):
     def setUp(self):
         self.app = App()
@@ -828,7 +806,6 @@ class BenchmarkTests(ShapeMixin, unittest.TestCase):
     def test_bad_approver(self):
         self.refused(App().handle("GET", "/api/benchmark", {"approver": "bribed"}), 400)
 
-    @unittest.skipUnless(HAVE_APPROVERS, "the benchmark has no approver models yet")
     def test_shape_for_every_approver(self):
         app = App()
         for approver in ("none", "careful", "careless"):
@@ -841,7 +818,6 @@ class BenchmarkTests(ShapeMixin, unittest.TestCase):
                 json.dumps(report, allow_nan=False)
         self.assertEqual(self.ok(app.handle("GET", "/api/benchmark"))["approver"], "none")
 
-    @unittest.skipUnless(HAVE_APPROVERS, "the benchmark has no approver models yet")
     def test_the_stage_shows_the_numbers_the_benchmark_reports(self):
         app = App()
         report = self.ok(app.handle("GET", "/api/benchmark", {"approver": "none"}))
@@ -856,7 +832,6 @@ class BenchmarkTests(ShapeMixin, unittest.TestCase):
                                      row["cells"][mode]["to_attacker"])
 
 
-@unittest.skipUnless(HAVE_FUZZ, "fuzz.run_fuzz is not in this build yet")
 class FuzzTests(ShapeMixin, unittest.TestCase):
     def test_a_short_run(self):
         result = self.ok(App().handle("GET", "/api/fuzz", {"runs": "5"}))
@@ -906,7 +881,6 @@ class RoutingTests(ShapeMixin, unittest.TestCase):
 # --- the live console ---------------------------------------------------------------
 
 
-@unittest.skipUnless(HAVE_STORE, "countersign.store is not in this build yet")
 class LiveTests(ShapeMixin, unittest.TestCase):
     TASK = {
         "instruction": "Pay this month's Nimbus Hosting invoice.",
